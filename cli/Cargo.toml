@@ -22,3 +22,4 @@ path = ".."
 [features]
 default = []
 cuda = ["stemgen/cuda"]
+migraphx = ["stemgen/migraphx"]

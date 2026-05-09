@@ -7,6 +7,8 @@ use ort::{session::{builder::GraphOptimizationLevel, Session}, value::Tensor};
 
 #[cfg(feature = "cuda")]
 use ort::{execution_providers::CUDAExecutionProvider};
+#[cfg(feature = "migraphx")]
+use ort::{execution_providers::MIGraphXExecutionProvider};
 
 use crate::constant::DEFAULT_MODEL;
 
@@ -35,7 +37,9 @@ pub enum Device {
     #[default]
     CPU,
     #[cfg(feature = "cuda")]
-    CUDA
+    CUDA,
+    #[cfg(feature = "migraphx")]
+    MIGraphX
 }
 
 impl std::fmt::Display for Device {
@@ -43,6 +47,8 @@ impl std::fmt::Display for Device {
         match self {
             #[cfg(feature = "cuda")]
             Device::CUDA => write!(f, "cuda"),
+            #[cfg(feature = "migraphx")]
+            Device::MIGraphX => write!(f, "migraphx"),
             Device::CPU => write!(f, "cpu"),
         }
     }
@@ -55,6 +61,8 @@ impl TryFrom<&str> for Device {
         match value {
             #[cfg(feature = "cuda")]
             "cuda" => Ok(Device::CUDA),
+            #[cfg(feature = "migraphx")]
+            "migraphx" => Ok(Device::MIGraphX),
             "cpu" => Ok(Device::CPU),
             _ => Err("unsupported device".to_owned()),
         }
@@ -111,6 +119,13 @@ impl Demucs {
                         .with_device_id(0)
                         // FIXME seem to wrongly set the memory limit to 0?
                         // .with_memory_limit(1 * 1024 * 1024 * 1024)
+                        .build()
+                        .error_on_failure()
+                ],
+                #[cfg(feature = "migraphx")]
+                Device::MIGraphX => vec![
+                    MIGraphXExecutionProvider::default()
+                        .with_device_id(0)
                         .build()
                         .error_on_failure()
                 ],
