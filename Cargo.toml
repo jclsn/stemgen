@@ -11,13 +11,29 @@ name = "stemgen"
 path = "src/lib.rs"
 
 [dependencies]
-taglib = { git = "https://github.com/acolombier/taglib-rust.git", tag = "v2.1.1", features = ["use-pkgconfig", "ni-stem"] }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = [
+  "codec",
+  "format",
+  "software-resampling"
+] }
 itertools = "0.13.0"
-ffmpeg-next = {version = "8.1.0", default-features = false, features = ["codec","format", "software-resampling"]}
-ndarray = { version = "0.17.2"}
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std","ndarray","copy-dylibs","download-binaries","fetch-models","migraphx","tls-native", "pkg-config"]}
-serde = {version = "1.0.219", features = ["derive"]}
+ndarray = { version = "0.17.2" }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = [
+  "copy-dylibs",
+  "download-binaries",
+  "fetch-models",
+  "migraphx",
+  "ndarray",
+  "pkg-config",
+  "std",
+  "tls-native"
+] }
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
+taglib = { git = "https://github.com/acolombier/taglib-rust.git", tag = "v2.1.1", features = [
+  "ni-stem",
+  "use-pkgconfig"
+] }
 
 [dependencies.chrono]
 version = "0.4.41"
@@ -25,7 +41,7 @@ optional = true
 
 [features]
 default = []
-cuda = ["ort/cuda" ]
-migraphx = ["ort/migraphx" ]
+cuda = ["ort/cuda"]
+migraphx = ["ort/migraphx"]
 
-benchmark = ["chrono" ]
+benchmark = ["chrono"]
