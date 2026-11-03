@@ -3,7 +3,7 @@ use std::fmt;
 use crate::nistem::Color;
 
 
-pub const DEFAULT_MODEL: &str = "https://github.com/mixxxdj/demucs/releases/latest/download/htdemucs.onnx";
+pub const DEFAULT_MODEL: &str = "https://github.com/mixxxdj/demucs/releases/download/v4.0.1-19-gd182d42-onnxmodel/htdemucs.onnx";
 pub const STEM_DEFAULT_LABEL: [&str; 4] = [
     "Drums",
     "Bass",
