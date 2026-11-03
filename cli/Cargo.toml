@@ -19,9 +19,11 @@ glob = "0.3.3"
 indicatif = "0.18.0"
 
 [dependencies.stemgen]
+default-features = false
 path = ".."
 
 [features]
-default = []
+default = ["download-binaries"]
+download-binaries = ["stemgen/download-binaries"]
 cuda = ["stemgen/cuda"]
 migraphx = ["stemgen/migraphx"]

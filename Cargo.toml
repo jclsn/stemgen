@@ -20,9 +20,7 @@ itertools = "0.13.0"
 ndarray = { version = "0.17.2" }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = [
   "copy-dylibs",
-  "download-binaries",
   "fetch-models",
-  "migraphx",
   "ndarray",
   "pkg-config",
   "std",
@@ -40,7 +38,10 @@ version = "0.4.41"
 optional = true
 
 [features]
-default = []
+default = ["download-binaries"]
+# Prebuilt ONNX Runtime binaries; they don't include MIGraphX, so build with
+# `--no-default-features --features migraphx` and a system ONNX Runtime instead.
+download-binaries = ["ort/download-binaries"]
 cuda = ["ort/cuda"]
 migraphx = ["ort/migraphx"]
 

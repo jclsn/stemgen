@@ -9,7 +9,7 @@ use std::time::Instant;
 #[cfg(feature = "cuda")]
 use ort::{execution_providers::CUDAExecutionProvider};
 #[cfg(feature = "migraphx")]
-use ort::{execution_providers::MIGraphXExecutionProvider};
+use ort::ep::{ExecutionProvider, MIGraphX};
 
 use crate::constant::DEFAULT_MODEL;
 
@@ -131,10 +131,17 @@ impl Demucs {
                 #[cfg(feature = "migraphx")]
                 Device::MIGraphX => {
                     eprintln!("[DEMUCS] Attempting to use MIGraphX execution provider");
-                    let provider = MIGraphXExecutionProvider::default()
-                        .with_device_id(0)
-                        .build()
-                        .error_on_failure();
+                    let provider = MIGraphX::default().with_device_id(0);
+
+                    // The prebuilt ONNX Runtime binaries don't ship MIGraphX, so catch a
+                    // mislinked runtime here rather than failing during session creation.
+                    if !provider.is_available()? {
+                        return Err("the linked ONNX Runtime has no MIGraphX execution provider; \
+                            build with `--no-default-features --features migraphx` against an \
+                            ONNX Runtime compiled with `--use_migraphx`".into());
+                    }
+
+                    let provider = provider.build().error_on_failure();
                     eprintln!("[DEMUCS] MIGraphX execution provider configured");
                     vec![provider]
                 },
