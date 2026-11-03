@@ -22,7 +22,6 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = [
   "copy-dylibs",
   "fetch-models",
   "ndarray",
-  "pkg-config",
   "std",
   "tls-native"
 ] }
@@ -43,7 +42,7 @@ default = ["download-binaries"]
 # `--no-default-features --features migraphx` and a system ONNX Runtime instead.
 download-binaries = ["ort/download-binaries"]
 cuda = ["ort/cuda"]
-migraphx = ["ort/migraphx"]
+migraphx = ["ort/migraphx", "ort/pkg-config"]
 webgpu = ["ort/webgpu", "download-binaries"]
 
 benchmark = ["chrono"]
