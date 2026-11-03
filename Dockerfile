@@ -16,7 +16,7 @@ RUN wget -O taglib.zip https://github.com/acolombier/taglib/archive/refs/heads/f
 WORKDIR /build
 ADD . .
 WORKDIR /build/cli
-ARG BUILD_ARGS=--all-features
+ARG BUILD_ARGS="--features cuda,migraphx"
 RUN --mount=type=cache,target=/build/target/release/build \
     --mount=type=cache,target=/build/target/release/deps \
     --mount=type=cache,target=/build/target/release/incremental \
@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/build/target/release/build \
 
 FROM --platform=$BUILDPLATFORM debian:trixie-slim
 ARG TARGETARCH
-ARG BUILD_ARGS=--all-features
+ARG BUILD_ARGS="--features cuda,migraphx"
 RUN --mount=type=cache,id=final,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=final,target=/var/lib/apt,sharing=locked \
     apt-get update && \
