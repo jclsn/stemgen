@@ -44,5 +44,6 @@ default = ["download-binaries"]
 download-binaries = ["ort/download-binaries"]
 cuda = ["ort/cuda"]
 migraphx = ["ort/migraphx"]
+webgpu = ["ort/webgpu", "download-binaries"]
 
 benchmark = ["chrono"]

@@ -10,6 +10,8 @@ use std::time::Instant;
 use ort::{execution_providers::CUDAExecutionProvider};
 #[cfg(feature = "migraphx")]
 use ort::ep::{ExecutionProvider, MIGraphX};
+#[cfg(feature = "webgpu")]
+use ort::ep::WebGPU;
 
 use crate::constant::DEFAULT_MODEL;
 
@@ -40,7 +42,9 @@ pub enum Device {
     #[cfg(feature = "cuda")]
     CUDA,
     #[cfg(feature = "migraphx")]
-    MIGraphX
+    MIGraphX,
+    #[cfg(feature = "webgpu")]
+    WebGPU
 }
 
 impl std::fmt::Display for Device {
@@ -50,6 +54,8 @@ impl std::fmt::Display for Device {
             Device::CUDA => write!(f, "cuda"),
             #[cfg(feature = "migraphx")]
             Device::MIGraphX => write!(f, "migraphx"),
+            #[cfg(feature = "webgpu")]
+            Device::WebGPU => write!(f, "webgpu"),
             Device::CPU => write!(f, "cpu"),
         }
     }
@@ -64,6 +70,8 @@ impl TryFrom<&str> for Device {
             "cuda" => Ok(Device::CUDA),
             #[cfg(feature = "migraphx")]
             "migraphx" => Ok(Device::MIGraphX),
+            #[cfg(feature = "webgpu")]
+            "webgpu" => Ok(Device::WebGPU),
             "cpu" => Ok(Device::CPU),
             _ => Err("unsupported device".to_owned()),
         }
@@ -144,6 +152,16 @@ impl Demucs {
                     let provider = provider.build().error_on_failure();
                     eprintln!("[DEMUCS] MIGraphX execution provider configured");
                     vec![provider]
+                },
+                #[cfg(feature = "webgpu")]
+                Device::WebGPU => {
+                    eprintln!("[DEMUCS] Using WebGPU execution provider");
+                    vec![
+                        WebGPU::default()
+                            .with_device_id(0)
+                            .build()
+                            .error_on_failure()
+                    ]
                 },
                 Device::CPU => {
                     eprintln!("[DEMUCS] Using CPU execution provider");

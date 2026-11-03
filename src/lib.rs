@@ -1,3 +1,8 @@
+// ort only ships prebuilt ONNX Runtime binaries for CUDA or WebGPU, not both, and silently falls
+// back to the CPU-only build when asked for the combination.
+#[cfg(all(feature = "cuda", feature = "webgpu", feature = "download-binaries"))]
+compile_error!("the `cuda` and `webgpu` features cannot be combined with `download-binaries`");
+
 pub mod constant;
 pub mod demucs;
 pub mod nistem;
