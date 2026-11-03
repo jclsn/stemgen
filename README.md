@@ -191,7 +191,7 @@ stemgen create [GENERATE OPTIONS, COMMON OPTIONS] OUTPUT
 
 Options for "generate":
   --model <model_name>            Demucs model.
-  --device <cpu or cuda>          Device for the demucs model inference
+  --device <cpu, cuda, migraphx>  Device for the demucs model inference
   --ext TEXT                      Extension for the STEM file
   --repo DIRECTORY                The local directory to use to fetch models
                                   for demucs.
