@@ -173,16 +173,34 @@ docker run \
 ### OpenVINO (Intel GPUs and NPUs)
 
 The prebuilt ONNX Runtime binaries don't include the OpenVINO execution
-provider, so this flavour links against a system ONNX Runtime built with it
-(found through `pkg-config`):
+provider, so this flavour links against an ONNX Runtime built with it:
 
 ```sh
-# ONNX Runtime with OpenVINO (needs the OpenVINO toolkit installed)
-./build.sh --config Release --build_shared_lib --use_openvino GPU --parallel
-# then, once libonnxruntime.pc is installed:
-cargo build --release --no-default-features --features openvino
+# 1. OpenVINO toolkit (https://docs.openvino.ai), then load its environment
+source /opt/intel/openvino/setupvars.sh
+
+# 2. ONNX Runtime as a shared library with the OpenVINO execution provider
+#    (the `--use_openvino` argument differs between ONNX Runtime versions,
+#    see https://onnxruntime.ai/docs/build/eps.html#openvino)
+git clone --recursive https://github.com/microsoft/onnxruntime && cd onnxruntime
+./build.sh --config Release --build_shared_lib --use_openvino GPU --parallel --skip_tests
+
+# 3. stemgen, linked to that build
+#    (or install it so `pkg-config libonnxruntime` finds it, and skip the variables)
+ORT_LIB_PATH=$PWD/build/Linux/Release ORT_PREFER_DYNAMIC_LINK=1 \
+    cargo build --release --no-default-features --features openvino
+
+# 4. make the ONNX Runtime libraries findable at runtime (stemgen also looks
+#    next to its own binary), and run with the OpenVINO environment loaded
+cp -P build/Linux/Release/libonnxruntime*.so* /path/to/stemgen/target/release/
 stemgen generate --device openvino ...
 ```
+
+`ORT_PREFER_DYNAMIC_LINK=1` is needed because the OpenVINO execution provider
+only exists in shared builds (`libonnxruntime.so` +
+`libonnxruntime_providers_openvino.so`); without it `ort` tries to link ONNX
+Runtime statically. Instead of copying the libraries, `LD_LIBRARY_PATH` can
+point to the ONNX Runtime build directory.
 
 `--device openvino` runs on the GPU; `openvino:npu` and `openvino:cpu` select
 the other targets. The model always runs in FP32 so the separation is the same
