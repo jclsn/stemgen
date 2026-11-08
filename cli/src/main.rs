@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::process::exit;
 
 use clap::Parser;
@@ -9,25 +10,52 @@ pub mod constants;
 mod create;
 mod generate;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Cli::parse();
-
+fn run(args: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
     match &args.command {
         Commands::Generate(command) => {
-            prepare_ffmpeg(&args)?;
-            if generate::generate(&args, command)? {
-                exit(1);
-            }
-            Ok(())
+            prepare_ffmpeg(args)?;
+            generate::generate(args, command)
         }
         Commands::Create(command) => {
-            prepare_ffmpeg(&args)?;
-            if create::create(&args, command)? {
-                exit(1);
-            }
-            Ok(())
+            prepare_ffmpeg(args)?;
+            create::create(args, command)
         }
     }
+}
+
+/// Whether process teardown must be skipped on exit.
+///
+/// `ort` releases its global ONNX Runtime environment from a `.fini_array` entry in this
+/// executable, which the dynamic loader runs *after* the Vulkan loader and driver have
+/// already been finalized. With the WebGPU execution provider, releasing the environment
+/// destroys the Dawn device, which then calls into the torn-down Vulkan driver and segfaults.
+fn skip_teardown(args: &Cli) -> bool {
+    match &args.command {
+        #[cfg(feature = "webgpu")]
+        Commands::Generate(command) => matches!(command.device, stemgen::demucs::Device::WebGPU),
+        _ => false,
+    }
+}
+
+fn main() {
+    let args = Cli::parse();
+
+    let code = match run(&args) {
+        Ok(false) => 0,
+        Ok(true) => 1,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            1
+        }
+    };
+
+    if skip_teardown(&args) {
+        // All output files are closed by now; only library teardown is skipped.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe { libc::_exit(code) };
+    }
+    exit(code);
 }
 
 #[cfg(test)]

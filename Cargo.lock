@@ -1024,6 +1024,7 @@ dependencies = [
  "ffmpeg-next",
  "glob",
  "indicatif",
+ "libc",
  "stemgen",
 ]
 
