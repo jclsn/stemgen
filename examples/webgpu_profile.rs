@@ -10,7 +10,8 @@
 //!
 //! Environment: `RUNS=<n>`, `NO_PATCH=1` (skip the model rewrite), `KEEP_PROFILE=1` (keep the
 //! raw ORT profile JSON), `CONFIG="key=value;..."` (extra session config entries), `DUMP=<file>` (write the last
-//! run's output as raw little-endian f32), `CPU=1` (run on the CPU EP, e.g. as a reference).
+//! run's output as raw little-endian f32), `CPU=1` (run on the CPU EP, e.g. as a reference), `INPUT=<file>` (a real chunk as raw
+//! planar f32 instead of the synthetic signal).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -85,6 +86,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             0.3 * (t * 440.0 * std::f32::consts::TAU).sin() + 0.2 * (t * 97.0 * std::f32::consts::TAU + (i / CHUNK) as f32).sin()
         })
         .collect();
+    // INPUT=<file>: a real chunk instead, as raw little-endian f32 in [1, 2, 343980] (planar) layout.
+    let input = match std::env::var("INPUT") {
+        Ok(path) => {
+            let input: Vec<f32> = std::fs::read(path)?.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+            if input.len() != CHUNK * 2 {
+                return Err(format!("INPUT must hold {} floats, got {}", CHUNK * 2, input.len()).into());
+            }
+            input
+        }
+        Err(_) => input,
+    };
     for i in 0..=runs {
         let tensor = Tensor::<f32>::from_array(([1usize, 2, CHUNK], input.clone()))?;
         let start = Instant::now();
