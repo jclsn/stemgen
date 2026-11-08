@@ -188,7 +188,7 @@ git clone --recursive https://github.com/microsoft/onnxruntime && cd onnxruntime
 # 3. stemgen, linked to that build
 #    (or install it so `pkg-config libonnxruntime` finds it, and skip the variables)
 ORT_LIB_PATH=$PWD/build/Linux/Release ORT_PREFER_DYNAMIC_LINK=1 \
-    cargo build --release --no-default-features --features openvino
+    cargo build --release --no-default-features --features openvino -p stemgen-cli
 
 # 4. make the ONNX Runtime libraries findable at runtime (stemgen also looks
 #    next to its own binary), and run with the OpenVINO environment loaded
