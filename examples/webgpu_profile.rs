@@ -10,7 +10,7 @@
 //!
 //! Environment: `RUNS=<n>`, `NO_PATCH=1` (skip the model rewrite), `KEEP_PROFILE=1` (keep the
 //! raw ORT profile JSON), `CONFIG="key=value;..."` (extra session config entries), `DUMP=<file>` (write the last
-//! run's output as raw little-endian f32).
+//! run's output as raw little-endian f32), `CPU=1` (run on the CPU EP, e.g. as a reference).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -71,9 +71,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // Registered after the config entries, which the EP reads when it is created.
-    let mut session = builder
-        .with_execution_providers([WebGPU::default().with_device_id(0).build().error_on_failure()])?
-        .commit_from_memory(&bytes)?;
+    if std::env::var_os("CPU").is_none() {
+        builder = builder.with_execution_providers([WebGPU::default().with_device_id(0).build().error_on_failure()])?;
+    }
+    let mut session = builder.commit_from_memory(&bytes)?;
     drop(bytes);
     println!("session creation: {:?}", start.elapsed());
 
@@ -118,6 +119,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     if dispatches.is_empty() {
+        if std::env::var_os("CPU").is_some() {
+            return Ok(());
+        }
         return Err("no GPU timestamps in the profile (is the WebGPU EP in use?)".into());
     }
     let last = &dispatches[dispatches.len() - dispatches.len() / (runs + 1)..];
