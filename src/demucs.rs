@@ -8,8 +8,12 @@ use std::time::Instant;
 
 #[cfg(feature = "cuda")]
 use ort::{execution_providers::CUDAExecutionProvider};
+#[cfg(any(feature = "migraphx", feature = "openvino"))]
+use ort::ep::ExecutionProvider;
 #[cfg(feature = "migraphx")]
-use ort::ep::{ExecutionProvider, MIGraphX};
+use ort::ep::MIGraphX;
+#[cfg(feature = "openvino")]
+use ort::ep::OpenVINO;
 #[cfg(feature = "webgpu")]
 use ort::ep::WebGPU;
 
@@ -44,7 +48,30 @@ pub enum Device {
     #[cfg(feature = "migraphx")]
     MIGraphX,
     #[cfg(feature = "webgpu")]
-    WebGPU
+    WebGPU,
+    #[cfg(feature = "openvino")]
+    OpenVINO(OpenVinoTarget),
+}
+
+/// The hardware an [OpenVINO](https://docs.openvino.ai) session runs on.
+#[cfg(feature = "openvino")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenVinoTarget {
+    Gpu,
+    Npu,
+    Cpu,
+}
+
+#[cfg(feature = "openvino")]
+impl OpenVinoTarget {
+    /// OpenVINO's `device_type`.
+    fn device_type(self) -> &'static str {
+        match self {
+            OpenVinoTarget::Gpu => "GPU",
+            OpenVinoTarget::Npu => "NPU",
+            OpenVinoTarget::Cpu => "CPU",
+        }
+    }
 }
 
 impl std::fmt::Display for Device {
@@ -56,6 +83,12 @@ impl std::fmt::Display for Device {
             Device::MIGraphX => write!(f, "migraphx"),
             #[cfg(feature = "webgpu")]
             Device::WebGPU => write!(f, "webgpu"),
+            #[cfg(feature = "openvino")]
+            Device::OpenVINO(OpenVinoTarget::Gpu) => write!(f, "openvino"),
+            #[cfg(feature = "openvino")]
+            Device::OpenVINO(OpenVinoTarget::Npu) => write!(f, "openvino:npu"),
+            #[cfg(feature = "openvino")]
+            Device::OpenVINO(OpenVinoTarget::Cpu) => write!(f, "openvino:cpu"),
             Device::CPU => write!(f, "cpu"),
         }
     }
@@ -72,6 +105,12 @@ impl TryFrom<&str> for Device {
             "migraphx" => Ok(Device::MIGraphX),
             #[cfg(feature = "webgpu")]
             "webgpu" => Ok(Device::WebGPU),
+            #[cfg(feature = "openvino")]
+            "openvino" | "openvino:gpu" => Ok(Device::OpenVINO(OpenVinoTarget::Gpu)),
+            #[cfg(feature = "openvino")]
+            "openvino:npu" => Ok(Device::OpenVINO(OpenVinoTarget::Npu)),
+            #[cfg(feature = "openvino")]
+            "openvino:cpu" => Ok(Device::OpenVINO(OpenVinoTarget::Cpu)),
             "cpu" => Ok(Device::CPU),
             _ => Err("unsupported device".to_owned()),
         }
@@ -196,6 +235,31 @@ impl Demucs {
                             .build()
                             .error_on_failure()
                     ]
+                },
+                #[cfg(feature = "openvino")]
+                Device::OpenVINO(target) => {
+                    eprintln!("[DEMUCS] Using OpenVINO execution provider on {}", target.device_type());
+                    let mut provider = OpenVINO::default()
+                        .with_device_type(target.device_type())
+                        // OpenVINO runs GPUs/NPUs in FP16 by default, which changes the
+                        // separation; keep the model's FP32 precision.
+                        .with_precision("FP32");
+                    // Compiling the model for the device takes a while; cache the result.
+                    if let Some(dir) = ort::sys::internal::dirs::cache_dir() {
+                        let dir = dir.join("openvino");
+                        if std::fs::create_dir_all(&dir).is_ok() {
+                            provider = provider.with_cache_dir(dir.to_string_lossy());
+                        }
+                    }
+
+                    // The prebuilt ONNX Runtime binaries don't ship OpenVINO, so catch a
+                    // mislinked runtime here rather than silently falling back to the CPU.
+                    if !provider.is_available()? {
+                        return Err("the linked ONNX Runtime has no OpenVINO execution provider; \
+                            build with `--no-default-features --features openvino` against an \
+                            ONNX Runtime compiled with `--use_openvino`".into());
+                    }
+                    vec![provider.build().error_on_failure()]
                 },
                 Device::CPU => {
                     eprintln!("[DEMUCS] Using CPU execution provider");
@@ -413,4 +477,25 @@ impl Demucs {
         Ok(data)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Device;
+
+    #[test]
+    fn test_device_names_round_trip() {
+        let mut names = vec!["cpu"];
+        #[cfg(feature = "webgpu")]
+        names.push("webgpu");
+        #[cfg(feature = "openvino")]
+        names.extend(["openvino", "openvino:npu", "openvino:cpu"]);
+        for name in names {
+            let device = Device::try_from(name).unwrap();
+            assert_eq!(device.to_string(), name);
+        }
+        #[cfg(feature = "openvino")]
+        assert_eq!(Device::try_from("openvino:gpu").unwrap().to_string(), "openvino");
+        assert!(Device::try_from("tpu").is_err());
+    }
 }

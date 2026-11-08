@@ -170,6 +170,25 @@ docker run \
         /path/to/folder
 ```
 
+### OpenVINO (Intel GPUs and NPUs)
+
+The prebuilt ONNX Runtime binaries don't include the OpenVINO execution
+provider, so this flavour links against a system ONNX Runtime built with it
+(found through `pkg-config`):
+
+```sh
+# ONNX Runtime with OpenVINO (needs the OpenVINO toolkit installed)
+./build.sh --config Release --build_shared_lib --use_openvino GPU --parallel
+# then, once libonnxruntime.pc is installed:
+cargo build --release --no-default-features --features openvino
+stemgen generate --device openvino ...
+```
+
+`--device openvino` runs on the GPU; `openvino:npu` and `openvino:cpu` select
+the other targets. The model always runs in FP32 so the separation is the same
+as on the other devices, and the compiled model is cached to speed up later
+runs.
+
 ## Usage
 
 ```text
@@ -191,8 +210,10 @@ stemgen create [GENERATE OPTIONS, COMMON OPTIONS] OUTPUT
 
 Options for "generate":
   --model <model_name>            Demucs model.
-  --device <cpu, cuda, migraphx, webgpu>
-                                  Device for the demucs model inference
+  --device <cpu, cuda, migraphx, webgpu, openvino[:gpu|npu|cpu]>
+                                  Device(s) for the demucs model inference.
+                                  Several devices (e.g. `webgpu,cpu`) separate
+                                  different chunks in parallel
   --ext TEXT                      Extension for the STEM file
   --repo DIRECTORY                The local directory to use to fetch models
                                   for demucs.

@@ -49,11 +49,12 @@ required-features = ["webgpu"]
 
 [features]
 default = ["download-binaries"]
-# Prebuilt ONNX Runtime binaries; they don't include MIGraphX, so build with
-# `--no-default-features --features migraphx` and a system ONNX Runtime instead.
+# Prebuilt ONNX Runtime binaries; they don't include MIGraphX or OpenVINO, so build with
+# `--no-default-features --features migraphx` (or `openvino`) and a system ONNX Runtime instead.
 download-binaries = ["ort/download-binaries"]
 cuda = ["ort/cuda"]
 migraphx = ["ort/migraphx", "ort/pkg-config"]
+openvino = ["ort/openvino", "ort/pkg-config"]
 webgpu = ["ort/webgpu", "download-binaries", "dep:sha2", "dep:ureq"]
 
 benchmark = ["chrono"]
