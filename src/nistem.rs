@@ -483,42 +483,66 @@ impl NIStem {
         if stems.len() != inner.idx_encoders.len() {
             return Err("unexpected buffer count".into());
         }
-        for (stream_idx, ((idx, encoder, resampler, timestamp), mut frames)) in inner.idx_encoders.iter_mut().zip(stems).enumerate() {
-            let frame_size = 2 * encoder.frame_size() as usize;
-            if !inner.overrun[stream_idx].is_empty(){
-                frames = {
-                    let mut v = inner.overrun[stream_idx].clone();
-                    v.extend(frames);
-                    v
-                };
-                inner.overrun[stream_idx].clear();
-            }
-            if frames.len() % frame_size != 0 {
-                let new_len = frames.len() - frames.len() % frame_size;
-                inner.overrun[stream_idx].extend_from_slice(&frames[new_len..]);
-                frames.resize(frames.len() - frames.len() % frame_size, 0.0);
-            }
-            for chunk in frames.chunks(frame_size) {
-                let mut frame = Audio::new(
-                    format::Sample::F32(format::sample::Type::Packed),
-                    chunk.len() / 2,
-                    ffmpeg_next::ChannelLayout::STEREO,
-                );
-                frame.set_rate(encoder.rate());
-                frame.set_pts(Some(*timestamp as i64));
-                *timestamp += chunk.len();
-                frame.plane_mut(0).copy_from_slice(chunk);
-                let mut resampled = Audio::empty();
-                resampler.run(&frame, &mut resampled)?;
-                encoder.send_frame(&resampled)?;
-                let mut encoded: Packet = Packet::empty();
-                while encoder.receive_packet(&mut encoded).is_ok() {
-                    encoded.set_stream(*idx);
-                    encoded.write(&mut inner.ctx)?;
-                }
+        // Streams are independent, so encode them in parallel and only serialize the muxing.
+        let encoded: Vec<Result<Vec<Packet>, ffmpeg_next::Error>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = inner
+                .idx_encoders
+                .iter_mut()
+                .zip(inner.overrun.iter_mut())
+                .zip(stems)
+                .map(|(((idx, encoder, resampler, timestamp), overrun), frames)| {
+                    scope.spawn(move || Self::encode_stream(*idx, encoder, resampler, timestamp, overrun, frames))
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().expect("encoder thread panicked")).collect()
+        });
+        for packets in encoded {
+            for packet in packets? {
+                packet.write(&mut inner.ctx)?;
             }
         }
         Ok(())
+    }
+
+    fn encode_stream(
+        idx: usize,
+        encoder: &mut encoder::Audio,
+        resampler: &mut resampling::Context,
+        timestamp: &mut usize,
+        overrun: &mut Vec<f32>,
+        mut frames: Vec<f32>,
+    ) -> Result<Vec<Packet>, ffmpeg_next::Error> {
+        let frame_size = 2 * encoder.frame_size() as usize;
+        if !overrun.is_empty() {
+            overrun.extend(frames);
+            frames = std::mem::take(overrun);
+        }
+        if frames.len() % frame_size != 0 {
+            let new_len = frames.len() - frames.len() % frame_size;
+            overrun.extend_from_slice(&frames[new_len..]);
+            frames.truncate(new_len);
+        }
+        let mut packets = Vec::new();
+        for chunk in frames.chunks(frame_size) {
+            let mut frame = Audio::new(
+                format::Sample::F32(format::sample::Type::Packed),
+                chunk.len() / 2,
+                ffmpeg_next::ChannelLayout::STEREO,
+            );
+            frame.set_rate(encoder.rate());
+            frame.set_pts(Some(*timestamp as i64));
+            *timestamp += chunk.len();
+            frame.plane_mut(0).copy_from_slice(chunk);
+            let mut resampled = Audio::empty();
+            resampler.run(&frame, &mut resampled)?;
+            encoder.send_frame(&resampled)?;
+            let mut encoded = Packet::empty();
+            while encoder.receive_packet(&mut encoded).is_ok() {
+                encoded.set_stream(idx);
+                packets.push(std::mem::replace(&mut encoded, Packet::empty()));
+            }
+        }
+        Ok(packets)
     }
 
     pub fn flush(self, manifest: Atom) -> Result<(), Box<dyn std::error::Error>> {
