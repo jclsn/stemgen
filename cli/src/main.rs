@@ -32,7 +32,7 @@ fn run(args: &Cli) -> Result<bool, Box<dyn std::error::Error>> {
 fn skip_teardown(args: &Cli) -> bool {
     match &args.command {
         #[cfg(feature = "webgpu")]
-        Commands::Generate(command) => matches!(command.device, stemgen::demucs::Device::WebGPU),
+        Commands::Generate(command) => command.device.iter().any(|d| matches!(d, stemgen::demucs::Device::WebGPU)),
         _ => false,
     }
 }
@@ -94,7 +94,7 @@ mod tests {
                     command: Commands::Generate (GenerateArgs {
                         files,
                         output,
-                        device: Device::CPU,
+                        device,
                         model: Model::Url(model_url),
                         thread: 4,
                         preserved_original_as_master: false
@@ -115,6 +115,7 @@ mod tests {
                     vocal_stem_label == "Vocals" &&
                     ext == "stem.mp4" &&
                     model_url == "http://example.com/htdemucs.onnx" &&
+                    matches!(device.as_slice(), [Device::CPU]) &&
                     output.display().to_string() == "~/MyMusic" &&
                     *files == [<&str as Into<String>>::into("./my_file.mp3")]
                 )

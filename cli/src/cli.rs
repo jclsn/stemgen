@@ -93,8 +93,15 @@ pub struct GenerateArgs {
     pub files: Vec<String>,
     #[arg(value_name = "OUTPUT", help = "path to an existing directory where to store the generated STEM file(s)", value_parser = value_parser!(PathBuf), required = true)]
     pub output: PathBuf,
-    #[arg(long, value_name = "DEVICE", help = "Device for the demucs model inference", value_parser = ValueParser::new(parse_device), default_value_t = Device::CPU)]
-    pub device: Device,
+    #[arg(
+        long,
+        value_name = "DEVICE",
+        help = "Device(s) for the demucs model inference. Several devices (e.g. `webgpu,cpu`) separate different chunks in parallel",
+        value_parser = ValueParser::new(parse_device),
+        value_delimiter = ',',
+        default_value = "cpu"
+    )]
+    pub device: Vec<Device>,
     #[arg(long, value_name = "PATH", help = "The model to use with demucs. Default to htdemucs fine-trained", value_parser = ValueParser::new(parse_model), default_value = DEFAULT_MODEL)]
     pub model: Model,
     #[arg(

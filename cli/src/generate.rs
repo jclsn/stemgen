@@ -1,10 +1,15 @@
-use std::{collections::VecDeque, ffi::OsStr, path::PathBuf, sync::mpsc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    ffi::OsStr,
+    path::PathBuf,
+    sync::{mpsc, Arc, Mutex},
+};
 
 use ffmpeg_next::Packet;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 use stemgen::{
-    demucs::{Demucs, DemusOpts},
+    demucs::{Demucs, DemusOpts, Device},
     nistem::{self, NIStem},
     track::Track,
 };
@@ -47,13 +52,12 @@ fn split_file_at_dot(file: &OsStr) -> (&OsStr, Option<&OsStr>) {
 }
 
 pub fn generate(ctx: &Cli, command: &GenerateArgs) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut demucs = Demucs::new_from_file(
-        &command.model,
-        DemusOpts {
-            threads: command.thread,
-            device: command.device,
-        },
-    )?;
+    // One model instance per device; they separate different chunks in parallel.
+    let devices = if command.device.is_empty() { vec![Device::default()] } else { command.device.clone() };
+    let mut demucs = devices
+        .iter()
+        .map(|device| Demucs::new_from_file(&command.model, DemusOpts { threads: command.thread, device: *device }))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut has_failure = false;
     let sample_rate: u64 = ctx.sample_rate.into();
 
@@ -100,7 +104,6 @@ pub fn generate(ctx: &Cli, command: &GenerateArgs) -> Result<bool, Box<dyn std::
             NIStem::new_with_consistent_streams(&output_file, ctx)?
         };
         nistem.clone(file)?;
-        let mut read = 0;
         let pb = ProgressBar::new(2 * input.total() as u64);
         pb.set_style(
             ProgressStyle::with_template(
@@ -111,55 +114,74 @@ pub fn generate(ctx: &Cli, command: &GenerateArgs) -> Result<bool, Box<dyn std::
         );
 
         let preserved = matches!(nistem, NIStem::PreservedMaster(..));
-        // Inference runs on a worker thread so the next chunk is separated while the previous
-        // one is being encoded.
+        // Each device runs inference on its own worker thread and takes the next chunk as soon as
+        // it is free, so chunks are separated in parallel (and while earlier ones are encoded).
+        // Results are encoded in chunk order.
+        let devices = demucs.len();
         std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
-            let (job_tx, job_rx) = mpsc::sync_channel::<(Vec<f32>, bool)>(1);
-            let (result_tx, result_rx) = mpsc::sync_channel::<Result<Option<Vec<Vec<f32>>>, String>>(1);
-            let demucs = &mut demucs;
-            scope.spawn(move || {
-                for (samples, last) in job_rx {
-                    let result = match demucs.send(&samples) {
-                        Ok(None) if last => demucs.flush().map(Some),
-                        other => other,
-                    };
-                    if result_tx.send(result.map_err(|e| e.to_string())).is_err() {
-                        break;
+            let (job_tx, job_rx) = mpsc::sync_channel::<(usize, Vec<f32>)>(devices);
+            let job_rx = Arc::new(Mutex::new(job_rx));
+            let (result_tx, result_rx) = mpsc::channel::<(usize, Result<Vec<Vec<f32>>, String>)>();
+            // Average seconds per chunk of each device, once it has separated one.
+            let speeds: Arc<Mutex<Vec<Option<f64>>>> = Arc::new(Mutex::new(vec![None; devices]));
+            for (device, worker) in demucs.iter_mut().enumerate() {
+                let (job_rx, result_tx, speeds) = (Arc::clone(&job_rx), result_tx.clone(), Arc::clone(&speeds));
+                scope.spawn(move || {
+                    let (mut busy, mut chunks) = (0f64, 0u32);
+                    loop {
+                        let job = job_rx.lock().unwrap().recv();
+                        let Ok((index, samples)) = job else { break };
+                        let start = std::time::Instant::now();
+                        let result = worker.separate(&samples).map_err(|e| e.to_string());
+                        (busy, chunks) = (busy + start.elapsed().as_secs_f64(), chunks + 1);
+                        if result_tx.send((index, result)).is_err() {
+                            break;
+                        }
+                        // A much slower device mostly delays the in-order encoding (whoever gets the
+                        // last chunk determines when the file is done), so it stops taking chunks.
+                        let mut speeds = speeds.lock().unwrap();
+                        speeds[device] = Some(busy / f64::from(chunks));
+                        let fastest = speeds.iter().flatten().copied().fold(f64::INFINITY, f64::min);
+                        if busy / f64::from(chunks) > 3.0 * fastest {
+                            eprintln!("Device {} is more than 3x slower than the fastest one, no longer using it for this file", device + 1);
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
+            drop(result_tx);
 
-            let mut buf: Vec<f32> = vec![0f32; 343980 * 2];
-            // Original packets/samples of the chunks submitted for inference, oldest first.
-            let mut in_flight: VecDeque<(Vec<Packet>, Vec<f32>, bool)> = VecDeque::new();
+            let mut buf: Vec<f32> = vec![0f32; Demucs::CHUNK_SAMPLES];
+            // Original packets/samples of the chunks not encoded yet, in chunk order.
+            let mut originals: VecDeque<(Vec<Packet>, Vec<f32>, usize, bool)> = VecDeque::new();
+            let mut separated: BTreeMap<usize, Vec<Vec<f32>>> = BTreeMap::new();
+            let (mut submitted, mut next, mut encoded) = (0usize, 0usize, 0usize);
             let mut input_done = false;
             loop {
-                if !input_done {
+                // Chunks are encoded in order, so a slower device holding an early chunk must not
+                // starve the others: let up to 4 chunks per device be in flight.
+                while !input_done && submitted - next < 4 * devices {
                     let mut original_packets = Vec::with_capacity(512);
                     let size = input.read(preserved.then_some(&mut original_packets), &mut buf)?;
-                    read += size;
                     let last = size != buf.len();
                     let original_buffer = if preserved { Vec::new() } else { buf[..size].to_vec() };
-                    job_tx.send((buf[..size].to_vec(), last))?;
-                    in_flight.push_back((original_packets, original_buffer, last));
+                    job_tx.send((submitted, buf[..size].to_vec()))?;
+                    originals.push_back((original_packets, original_buffer, size, last));
+                    submitted += 1;
                     input_done = last;
-                    // Keep one chunk queued ahead of the one being encoded.
-                    if !input_done && in_flight.len() < 2 {
-                        continue;
-                    }
                 }
-                let Some((mut original_packets, mut original_buffer, last)) = in_flight.pop_front() else {
+                let Some((original_packets, original_buffer, size, last)) = originals.pop_front() else {
                     break;
                 };
-                let Some(mut data) = result_rx.recv()?? else {
-                    // Not enough samples for a chunk yet: carry the originals over to the next one.
-                    let next = in_flight.front_mut().ok_or("inference returned no data for the last chunk")?;
-                    original_packets.append(&mut next.0);
-                    original_buffer.append(&mut next.1);
-                    (next.0, next.1) = (original_packets, original_buffer);
-                    continue;
-                };
-                pb.set_position(read as u64 / sample_rate);
+                while !separated.contains_key(&next) {
+                    let (index, result) = result_rx.recv()?;
+                    separated.insert(index, result?);
+                }
+                let mut data = separated.remove(&next).unwrap();
+                next += 1;
+                // Progress counts encoded samples: reading runs ahead of separation.
+                encoded += size;
+                pb.set_position(encoded as u64 / sample_rate);
                 if preserved {
                     nistem.write_preserved(original_packets, data)?;
                 } else {
