@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5.46", features = ["cargo", "derive"] }
-ffmpeg-next = { version = "8.1.0", default-features = false, features = [
+ffmpeg-next = { version = "9.0.0", default-features = false, features = [
   "codec",
   "format",
   "software-resampling"

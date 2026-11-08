@@ -501,14 +501,13 @@ impl NIStem {
             for chunk in frames.chunks(frame_size) {
                 let mut frame = Audio::new(
                     format::Sample::F32(format::sample::Type::Packed),
-                    chunk.len(),
+                    chunk.len() / 2,
                     ffmpeg_next::ChannelLayout::STEREO,
                 );
                 frame.set_rate(encoder.rate());
                 frame.set_pts(Some(*timestamp as i64));
                 *timestamp += chunk.len();
                 frame.plane_mut(0).copy_from_slice(chunk);
-                frame.set_samples(chunk.len()/2);
                 let mut resampled = Audio::empty();
                 resampler.run(&frame, &mut resampled)?;
                 encoder.send_frame(&resampled)?;
@@ -532,14 +531,13 @@ impl NIStem {
                 let chunk = &inner.overrun[stream_idx];
                 let mut frame = Audio::new(
                     format::Sample::F32(format::sample::Type::Packed),
-                    chunk.len(),
+                    chunk.len() / 2,
                     ffmpeg_next::ChannelLayout::STEREO,
                 );
                 frame.set_rate(encoder.rate());
                 frame.set_pts(Some(*timestamp as i64));
                 *timestamp += chunk.len();
                 frame.plane_mut(0).copy_from_slice(chunk);
-                frame.set_samples(chunk.len()/2);
                 let mut resampled = Audio::empty();
                 resampler.run(&frame, &mut resampled)?;
                 encoder.send_frame(&resampled)?;

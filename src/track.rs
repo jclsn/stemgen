@@ -132,7 +132,6 @@ impl Track {
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 let mut resampled = Audio::empty();
                 self.resampler.run(&decoded, &mut resampled)?;
-                resampled.set_samples(resampled.samples() * decoded.planes()); // FIXME seems to be a bug upstream?
                 // println!("frame {:?}", resampled.pts());
                 read += process(resampled, buf, read);
             }
@@ -152,7 +151,6 @@ impl Track {
                     if resampled.planes() == 0 {
                         break;
                     }
-                    resampled.set_samples(resampled.samples() * decoded.planes()); // FIXME seems to be a bug upstream?
                     read += process(resampled, buf, read);
                 }
                 break;

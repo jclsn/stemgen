@@ -120,14 +120,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for chunk in frames.chunks(frame_size) {
             let mut frame = Audio::new(
                 format::Sample::F32(format::sample::Type::Packed),
-                chunk.len(),
+                chunk.len() / 2,
                 ffmpeg_next::ChannelLayout::STEREO,
             );
             frame.set_rate(sample_rate as u32);
             frame.set_pts(Some(*timestamp as i64));
             *timestamp += chunk.len();
             frame.plane_mut(0).copy_from_slice(chunk);
-            frame.set_samples(chunk.len() / 2);
             let mut resampled = Audio::empty();
             resampler.run(&frame, &mut resampled).unwrap();
             encoder.send_frame(&resampled).unwrap();
@@ -144,14 +143,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chunk = &overrun[stream_idx];
             let mut frame = Audio::new(
                 format::Sample::F32(format::sample::Type::Packed),
-                chunk.len(),
+                chunk.len() / 2,
                 ffmpeg_next::ChannelLayout::STEREO,
             );
             frame.set_rate(sample_rate as u32);
             frame.set_pts(Some(*timestamp as i64));
             *timestamp += chunk.len();
             frame.plane_mut(0).copy_from_slice(chunk);
-            frame.set_samples(chunk.len() / 2);
             let mut resampled = Audio::empty();
             resampler.run(&frame, &mut resampled).unwrap();
             encoder.send_frame(&resampled).unwrap();

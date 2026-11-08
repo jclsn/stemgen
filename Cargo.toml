@@ -11,7 +11,7 @@ name = "stemgen"
 path = "src/lib.rs"
 
 [dependencies]
-ffmpeg-next = { version = "8.1.0", default-features = false, features = [
+ffmpeg-next = { version = "9.0.0", default-features = false, features = [
   "codec",
   "format",
   "software-resampling"
