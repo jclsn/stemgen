@@ -153,10 +153,9 @@ pub fn fetch_model(url: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 impl Demucs {
     pub fn new_from_file(model: &Model, ops: DemusOpts) -> Result<Self, Box<dyn std::error::Error>> {
         eprintln!("[DEMUCS] Creating new Demucs instance with device: {}", ops.device);
-        let init_start = Instant::now();
-        ort::init()
-            .with_execution_providers(
-            match ops.device {
+        // Execution providers are registered per session (not on the global environment) so that
+        // several Demucs instances can run on different devices in the same process.
+        let providers: Vec<ort::ep::ExecutionProviderDispatch> = match ops.device {
                 #[cfg(feature = "cuda")]
                 Device::CUDA => {
                     eprintln!("[DEMUCS] Using CUDA execution provider");
@@ -202,16 +201,13 @@ impl Demucs {
                     eprintln!("[DEMUCS] Using CPU execution provider");
                     vec![]
                 }
-            })
-            .commit();
-
-        let init_duration = init_start.elapsed();
-        eprintln!("[DEMUCS] ORT initialization took: {:?}", init_duration);
+            };
 
         let session_start = Instant::now();
         let mut session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(ops.threads)?;
+            .with_intra_threads(ops.threads)?
+            .with_execution_providers(providers)?;
 
         let session = match (model, ops.device) {
             #[cfg(feature = "webgpu")]
@@ -363,6 +359,33 @@ impl Demucs {
 
         let process_duration = process_start.elapsed();
         eprintln!("[DEMUCS] Total process() took: {:?}", process_duration);
+        Ok(stems)
+    }
+
+    /// Number of interleaved stereo samples in one inference chunk.
+    pub const CHUNK_SAMPLES: usize = 2 * 343980;
+
+    /// Separates one chunk of at most [`Self::CHUNK_SAMPLES`] interleaved stereo samples on its own,
+    /// independently of [`Self::send`]'s buffering. The stems have the same length as `samples`.
+    pub fn separate(&mut self, samples: &[f32]) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
+        if samples.len() % 2 != 0 {
+            return Err("uneven number of sample".into());
+        }
+        if samples.len() > Self::CHUNK_SAMPLES {
+            return Err("more samples than fit in one chunk".into());
+        }
+        if samples.is_empty() {
+            return Ok(vec![Vec::new(); 4]);
+        }
+        let buffered = std::mem::take(&mut self.input_buffer);
+        self.input_buffer.extend_from_slice(samples);
+        self.input_buffer.resize(Self::CHUNK_SAMPLES, 0.0);
+        let result = self.process();
+        self.input_buffer = buffered;
+        let mut stems = result?;
+        for stem in stems.iter_mut() {
+            stem.truncate(samples.len());
+        }
         Ok(stems)
     }
 
