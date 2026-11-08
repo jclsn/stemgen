@@ -1009,6 +1009,7 @@ dependencies = [
  "chrono",
  "ffmpeg-next",
  "itertools",
+ "libc",
  "ndarray",
  "ort",
  "serde",

@@ -118,7 +118,7 @@ impl Default for DemusOpts {
 /// Downloads `url` into ort's model cache (the same location `commit_from_url` uses) and returns
 /// the cached path, so models can be read and patched before the session is created.
 #[cfg(feature = "webgpu")]
-fn fetch_model(url: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub fn fetch_model(url: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     use sha2::{Digest, Sha256};
     use std::fmt::Write;
 
