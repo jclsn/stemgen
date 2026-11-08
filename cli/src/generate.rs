@@ -1,5 +1,6 @@
-use std::{ffi::OsStr, path::PathBuf};
+use std::{collections::VecDeque, ffi::OsStr, path::PathBuf, sync::mpsc};
 
+use ffmpeg_next::Packet;
 use glob::glob;
 use indicatif::{ProgressBar, ProgressStyle};
 use stemgen::{
@@ -109,48 +110,68 @@ pub fn generate(ctx: &Cli, command: &GenerateArgs) -> Result<bool, Box<dyn std::
             .progress_chars("#>-"),
         );
 
-        loop {
+        let preserved = matches!(nistem, NIStem::PreservedMaster(..));
+        // Inference runs on a worker thread so the next chunk is separated while the previous
+        // one is being encoded.
+        std::thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
+            let (job_tx, job_rx) = mpsc::sync_channel::<(Vec<f32>, bool)>(1);
+            let (result_tx, result_rx) = mpsc::sync_channel::<Result<Option<Vec<Vec<f32>>>, String>>(1);
+            let demucs = &mut demucs;
+            scope.spawn(move || {
+                for (samples, last) in job_rx {
+                    let result = match demucs.send(&samples) {
+                        Ok(None) if last => demucs.flush().map(Some),
+                        other => other,
+                    };
+                    if result_tx.send(result.map_err(|e| e.to_string())).is_err() {
+                        break;
+                    }
+                }
+            });
+
             let mut buf: Vec<f32> = vec![0f32; 343980 * 2];
-            let mut original_packets = Vec::with_capacity(512);
-            let mut original_buffer: Vec<f32> = Vec::with_capacity(512);
-
-            let (data, eof) = loop {
-                let size = input.read(
-                    if matches!(nistem, NIStem::PreservedMaster(..)) {
-                        Some(&mut original_packets)
-                    } else {
-                        None
-                    },
-                    &mut buf,
-                )?;
-                read += size;
-                if matches!(nistem, NIStem::ConsistentStream(..)) {
-                    original_buffer.extend(buf[..size].to_vec());
-                }
-                if let Some(mut data) = demucs.send(&buf[..size])? {
-                    if matches!(nistem, NIStem::ConsistentStream(..)) {
-                        data.insert(0, original_buffer);
+            // Original packets/samples of the chunks submitted for inference, oldest first.
+            let mut in_flight: VecDeque<(Vec<Packet>, Vec<f32>, bool)> = VecDeque::new();
+            let mut input_done = false;
+            loop {
+                if !input_done {
+                    let mut original_packets = Vec::with_capacity(512);
+                    let size = input.read(preserved.then_some(&mut original_packets), &mut buf)?;
+                    read += size;
+                    let last = size != buf.len();
+                    let original_buffer = if preserved { Vec::new() } else { buf[..size].to_vec() };
+                    job_tx.send((buf[..size].to_vec(), last))?;
+                    in_flight.push_back((original_packets, original_buffer, last));
+                    input_done = last;
+                    // Keep one chunk queued ahead of the one being encoded.
+                    if !input_done && in_flight.len() < 2 {
+                        continue;
                     }
-                    break (data, false)
                 }
-                if size != buf.len() {
-                    let mut data = demucs.flush()?;
-                    if matches!(nistem, NIStem::ConsistentStream(..)) {
-                        data.insert(0, original_buffer);
-                    }
-                    break (data, true);
+                let Some((mut original_packets, mut original_buffer, last)) = in_flight.pop_front() else {
+                    break;
+                };
+                let Some(mut data) = result_rx.recv()?? else {
+                    // Not enough samples for a chunk yet: carry the originals over to the next one.
+                    let next = in_flight.front_mut().ok_or("inference returned no data for the last chunk")?;
+                    original_packets.append(&mut next.0);
+                    original_buffer.append(&mut next.1);
+                    (next.0, next.1) = (original_packets, original_buffer);
+                    continue;
+                };
+                pb.set_position(read as u64 / sample_rate);
+                if preserved {
+                    nistem.write_preserved(original_packets, data)?;
+                } else {
+                    data.insert(0, original_buffer);
+                    nistem.write_consistent(data)?;
                 }
-            };
-            pb.set_position(read as u64 / sample_rate);
-            match nistem {
-                NIStem::PreservedMaster(..) => nistem.write_preserved(original_packets, data)?,
-                NIStem::ConsistentStream(..) => nistem.write_consistent(data)?,
+                if last {
+                    break;
+                }
             }
-
-            if eof {
-                break;
-            }
-        }
+            Ok(())
+        })?;
 
         pb.finish_with_message(format!("downloaded {}", filename.display()));
         nistem.flush(nistem::Atom {
