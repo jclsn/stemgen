@@ -290,8 +290,16 @@ enum Attr<'a> {
     Int(i64),
 }
 
+#[cfg(test)]
 fn encode_node(op_type: &str, name: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, Attr)]) -> Vec<u8> {
+    encode_node_in("", op_type, name, inputs, outputs, attrs)
+}
+
+fn encode_node_in(domain: &str, op_type: &str, name: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, Attr)]) -> Vec<u8> {
     let mut out = Vec::new();
+    if !domain.is_empty() {
+        put_bytes(&mut out, node::DOMAIN, domain.as_bytes());
+    }
     for i in inputs {
         put_bytes(&mut out, node::INPUT, i.as_bytes());
     }
@@ -364,10 +372,47 @@ impl<'a> Emitter<'a> {
 
     /// Adds a node; `output` names its result, or `None` for a fresh internal name.
     fn op(&mut self, op_type: &str, inputs: &[&str], output: Option<&str>, attrs: &[(&str, Attr)]) -> String {
+        self.op_in("", op_type, inputs, output, attrs)
+    }
+
+    fn op_in(&mut self, domain: &str, op_type: &str, inputs: &[&str], output: Option<&str>, attrs: &[(&str, Attr)]) -> String {
         let out = output.map(str::to_owned).unwrap_or_else(|| self.name(op_type));
         let name = self.name(op_type);
-        self.nodes.push(encode_node(op_type, &name, inputs, &[&out], attrs));
+        self.nodes.push(encode_node_in(domain, op_type, &name, inputs, &[&out], attrs));
         out
+    }
+
+    fn i64_scalar(&mut self, value: i64) -> String {
+        let name = self.name("const");
+        self.initializers.push(encode_tensor(&name, tensor::INT64, &[], &value.to_le_bytes()));
+        name
+    }
+
+    /// Mean of `x[N, 1, rest]` over its last axis -> `[N, 1, 1]`.
+    ///
+    /// A plain ReduceMean runs each output in a single workgroup, which is slow for HTDemucs'
+    /// ~100K-element rows. Instead the row is zero-padded to a multiple of `GROUPS` (the padding is
+    /// computed from its runtime length), summed in `GROUPS` parallel chunks, and the partial sums
+    /// added and divided by the true length.
+    fn parallel_row_mean(&mut self, x: &str) -> String {
+        const GROUPS: i64 = 256;
+        let row = self.reshape(x, &[0, -1]); // [N, rest]
+        let shape = self.op("Shape", &[&row], None, &[]);
+        let index1 = self.i64_scalar(1);
+        let len = self.op("Gather", &[&shape, &index1], None, &[("axis", Attr::Int(0))]);
+        let groups = self.i64_scalar(GROUPS);
+        let rem = self.op("Mod", &[&len, &groups], None, &[]);
+        let missing = self.op("Sub", &[&groups, &rem], None, &[]);
+        let missing = self.op("Mod", &[&missing, &groups], None, &[]);
+        let missing = self.reshape(&missing, &[1]);
+        let zeros = self.i64s(&[0, 0, 0]);
+        let pads = self.op("Concat", &[&zeros, &missing], None, &[("axis", Attr::Int(0))]);
+        let padded = self.op("Pad", &[&row, &pads], None, &[]);
+        let chunks = self.reshape(&padded, &[0, GROUPS, -1]); // [N, GROUPS, ceil(rest / GROUPS)]
+        let sums = self.reduce("ReduceSum", &chunks, 2, None);
+        let sum = self.reduce("ReduceSum", &sums, 1, None); // [N, 1, 1]
+        let len = self.op("Cast", &[&len], None, &[("to", Attr::Int(tensor::FLOAT))]);
+        self.op("Div", &[&sum, &len], None, &[])
     }
 
     fn reshape(&mut self, x: &str, shape: &[i64]) -> String {
@@ -395,12 +440,17 @@ impl<'a> Emitter<'a> {
     }
 
     fn reduce_mean_to(&mut self, x: &str, axis: i64, output: Option<&str>) -> String {
-        // Opset 18 moved `axes` from an attribute to an input.
-        if self.opset >= 18 {
+        self.reduce("ReduceMean", x, axis, output)
+    }
+
+    /// A reduction over one axis, keeping it.
+    fn reduce(&mut self, op_type: &str, x: &str, axis: i64, output: Option<&str>) -> String {
+        // Opset 18 moved `axes` from an attribute to an input (opset 13 already for ReduceSum).
+        if self.opset >= 18 || (op_type == "ReduceSum" && self.opset >= 13) {
             let axes = self.i64s(&[axis]);
-            self.op("ReduceMean", &[x, &axes], output, &[])
+            self.op(op_type, &[x, &axes], output, &[])
         } else {
-            self.op("ReduceMean", &[x], output, &[("axes", Attr::Ints(&[axis]))])
+            self.op(op_type, &[x], output, &[("axes", Attr::Ints(&[axis]))])
         }
     }
 
@@ -682,14 +732,54 @@ fn emit_matmul_overlap_add(e: &mut Emitter, input: &str, output: &str, weight: &
 /// rest gives the same mean (every channel has the same size) with one workgroup per position.
 /// Channels first matches the EP's channels-last (NHWC) activations, which avoids a transpose
 /// before the first reduction (~2.5x less reduction time than rest-first on an RX 9070).
+/// Emits `Add(Mul(Reshape(GroupNorm₁(x), Shape(x)), gamma), beta)` (a single-group GroupNorm with
+/// its per-channel affine) in 8 passes over the tensor instead of 12: the variance comes from
+/// `ReduceSumSquare` of the centered values (no squared tensor), and `1/std` is folded into `gamma`
+/// instead of dividing the whole tensor.
+///
+/// `1/std` is reshaped to `x`'s rank (`[N, 1, ..., 1]`, built from `Shape(x)` at runtime) so that
+/// multiplying by `gamma` broadcasts exactly as the original `Mul` did, whatever `x`'s rank.
+fn emit_group_norm_affine(e: &mut Emitter, x0: &str, gamma: &str, beta: &str, output: &str, epsilon: f32) {
+    let x = e.reshape(x0, &[0, 0, -1]); // [N, C, rest]
+    let mean = e.reduce_mean(&x, 1);
+    let mean = e.parallel_row_mean(&mean); // [N, 1, 1]
+    let centered = e.op("Sub", &[&x, &mean], None, &[]);
+    let sum_squares = e.reduce("ReduceSumSquare", &centered, 1, None); // [N, 1, rest]
+    let variance_times_c = e.parallel_row_mean(&sum_squares); // [N, 1, 1]
+
+    let shape = e.op("Shape", &[x0], None, &[]);
+    let index1 = e.name("const");
+    e.initializers.push(encode_tensor(&index1, tensor::INT64, &[], &1i64.to_le_bytes()));
+    let channels = e.op("Gather", &[&shape, &index1], None, &[("axis", Attr::Int(0))]);
+    let channels = e.op("Cast", &[&channels], None, &[("to", Attr::Int(tensor::FLOAT))]);
+    let variance = e.op("Div", &[&variance_times_c, &channels], None, &[]);
+    let epsilon = e.f32s("epsilon", &[1], &[epsilon]);
+    let variance = e.op("Add", &[&variance, &epsilon], None, &[]);
+    let std = e.op("Sqrt", &[&variance], None, &[]);
+    let one = e.f32s("one", &[1], &[1.0]);
+    let inv_std = e.op("Div", &[&one, &std], None, &[]); // [N, 1, 1]
+
+    // [N, 1, ..., 1] with x's rank.
+    let ones = e.op("Div", &[&shape, &shape], None, &[]);
+    let batch = e.slice(&shape, 0, 0, 1);
+    let ones = e.slice(&ones, 0, 1, i64::MAX);
+    let target = e.op("Concat", &[&batch, &ones], None, &[("axis", Attr::Int(0))]);
+    let inv_std = e.op("Reshape", &[&inv_std, &target], None, &[]);
+    let scale = e.op("Mul", &[&inv_std, gamma], None, &[]);
+
+    let centered = e.op("Reshape", &[&centered, &shape], None, &[]); // x's shape
+    let scaled = e.op("Mul", &[&centered, &scale], None, &[]);
+    e.op("Add", &[&scaled, beta], Some(output), &[]);
+}
+
 fn emit_group_norm(e: &mut Emitter, x: &str, scale: &str, bias: &str, output: &str, epsilon: f32, identity_affine: bool) {
     let x = e.reshape(x, &[0, 0, -1]); // [N, C, rest]
     let mean = e.reduce_mean(&x, 1);
-    let mean = e.reduce_mean(&mean, 2); // [N, 1, 1]
+    let mean = e.parallel_row_mean(&mean); // [N, 1, 1]
     let centered = e.op("Sub", &[&x, &mean], None, &[]);
     let squared = e.op("Mul", &[&centered, &centered], None, &[]);
     let variance = e.reduce_mean(&squared, 1);
-    let variance = e.reduce_mean(&variance, 2);
+    let variance = e.parallel_row_mean(&variance);
     let epsilon = e.f32s("epsilon", &[1], &[epsilon]);
     let variance = e.op("Add", &[&variance, &epsilon], None, &[]);
     let std = e.op("Sqrt", &[&variance], None, &[]);
@@ -809,6 +899,11 @@ fn emit_conv1d_matmul(e: &mut Emitter, conv: &Conv1d) {
     }
 }
 
+// --- GELU -> fused Gelu ----------------------------------------------------------------------
+
+/// ONNX Runtime's contrib-op domain.
+const MS_DOMAIN: &str = "com.microsoft";
+
 // --- Matching ----------------------------------------------------------------------------------
 
 /// A 1-D, ungrouped, unpadded strided (transposed) convolution with a constant weight.
@@ -918,6 +1013,8 @@ pub struct Rewrites {
     pub reduce_mean: usize,
     /// Bottleneck 1-D Convs replaced by shifted MatMuls.
     pub conv1d: usize,
+    /// Exact (erf) GELUs fused into `com.microsoft.Gelu`.
+    pub gelu: usize,
 }
 
 impl Rewrites {
@@ -930,8 +1027,8 @@ impl std::fmt::Display for Rewrites {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "STFT→FFT ×{}, iSTFT→FFT ×{}, iSTFT→MatMul ×{}, GroupNorm ×{}, ReduceMean ×{}, Conv1d ×{}",
-            self.stft_fft, self.istft_fft, self.istft_matmul, self.group_norm, self.reduce_mean, self.conv1d
+            "STFT→FFT ×{}, iSTFT→FFT ×{}, iSTFT→MatMul ×{}, GroupNorm ×{}, ReduceMean ×{}, Conv1d ×{}, GELU ×{}",
+            self.stft_fft, self.istft_fft, self.istft_matmul, self.group_norm, self.reduce_mean, self.conv1d, self.gelu
         )
     }
 }
@@ -1038,8 +1135,20 @@ pub fn optimize_for_webgpu(model: &[u8]) -> Result<Option<(Vec<u8>, Rewrites)>> 
         }
         replacements.insert(index, e.nodes);
     }
-    // Single-group GroupNorm: Reshape(x, [0, 1, -1]) -> InstanceNormalization.
+    // Single-group GroupNorm: Reshape(x, [0, 1, -1]) -> InstanceNormalization, usually followed by
+    // Reshape(·, Shape(x)) -> Mul(·, gamma) -> Add(·, beta).
     let producers: std::collections::HashMap<&str, &Node> = nodes.iter().flat_map(|n| n.outputs.iter().map(move |o| (*o, n))).collect();
+    let mut consumers: std::collections::HashMap<&str, Vec<usize>> = Default::default();
+    for (index, n) in nodes.iter().enumerate() {
+        for i in &n.inputs {
+            consumers.entry(i).or_default().push(index);
+        }
+    }
+    let sole_consumer = |value: &str| match consumers.get(value).map(Vec::as_slice) {
+        Some([index]) => Some(*index),
+        _ => None,
+    };
+    let is_constant = |name: &str| constant(name).is_some();
     for (index, node) in nodes.iter().enumerate() {
         if node.op_type != "InstanceNormalization" || !node.domain.is_empty() || node.inputs.len() != 3 || node.outputs.len() != 1 {
             continue;
@@ -1054,8 +1163,44 @@ pub fn optimize_for_webgpu(model: &[u8]) -> Result<Option<(Vec<u8>, Rewrites)>> 
         let values = |name: &str| -> Result<Option<Vec<f32>>> { Ok(weight(name)?.map(|t| to_f32(&t))) };
         let identity_affine = values(node.inputs[1])? == Some(vec![1.0]) && values(node.inputs[2])? == Some(vec![0.0]);
         let epsilon = node.attr_float("epsilon").unwrap_or(1e-5);
+        let x0 = reshape.inputs[0];
+
+        // Reshape(·, Shape(x0)) -> Mul(·, gamma) -> Add(·, beta), each the sole consumer.
+        let affine = (|| {
+            let back_index = sole_consumer(node.outputs[0])?;
+            let back = &nodes[back_index];
+            let shape = producers.get(back.inputs.get(1)?)?;
+            if back.op_type != "Reshape" || shape.op_type != "Shape" || shape.inputs.first() != Some(&x0) || shape.attributes.len() > 0 {
+                return None;
+            }
+            // The constant operand of a binary op whose other operand is `input`.
+            fn other<'a>(n: &Node<'a>, input: &str, is_constant: &dyn Fn(&str) -> bool) -> Option<&'a str> {
+                match n.inputs.as_slice() {
+                    [a, b] if *a == input && is_constant(b) => Some(b),
+                    [a, b] if *b == input && is_constant(a) => Some(a),
+                    _ => None,
+                }
+            }
+            let mul_index = sole_consumer(back.outputs[0])?;
+            let mul = &nodes[mul_index];
+            let gamma = (mul.op_type == "Mul" && mul.domain.is_empty()).then(|| other(mul, back.outputs[0], &is_constant)).flatten()?;
+            let add_index = sole_consumer(mul.outputs[0])?;
+            let add = &nodes[add_index];
+            let beta = (add.op_type == "Add" && add.domain.is_empty()).then(|| other(add, mul.outputs[0], &is_constant)).flatten()?;
+            Some(([back_index, mul_index, add_index], gamma, beta, add.outputs[0]))
+        })()
+        .filter(|(indices, ..)| identity_affine && indices.iter().all(|i| !replacements.contains_key(i)));
+
         let mut e = Emitter::new(format!("stemgen_groupnorm{}", rewrites.group_norm), &mut new_initializers, opset);
-        emit_group_norm(&mut e, reshape.inputs[0], node.inputs[1], node.inputs[2], node.outputs[0], epsilon, identity_affine);
+        match affine {
+            Some((indices, gamma, beta, output)) => {
+                emit_group_norm_affine(&mut e, x0, gamma, beta, output, epsilon);
+                for i in indices {
+                    replacements.insert(i, Vec::new());
+                }
+            }
+            None => emit_group_norm(&mut e, x0, node.inputs[1], node.inputs[2], node.outputs[0], epsilon, identity_affine),
+        }
         replacements.insert(index, e.nodes);
         rewrites.group_norm += 1;
     }
@@ -1088,6 +1233,59 @@ pub fn optimize_for_webgpu(model: &[u8]) -> Result<Option<(Vec<u8>, Rewrites)>> 
         }
         replacements.insert(index, e.nodes);
         rewrites.reduce_mean += 1;
+    }
+
+    // Exact GELU, x * 0.5 * (1 + erf(x / sqrt(2))), as exported by PyTorch:
+    //   Mul(Mul(x, Add(Erf(Div(x, sqrt(2))), 1)), 0.5)  (any operand order)
+    // -> one fused Gelu instead of five passes over the tensor.
+    let scalar = |name: &str| -> Result<Option<f32>> {
+        Ok(constant(name).map(FloatTensor::parse).transpose()?.flatten().and_then(|t| (t.data.len() == 4).then(|| f32::from_le_bytes(t.data[..4].try_into().unwrap()))))
+    };
+    let producer = |name: &str, op_type: &str| producers.get(name).copied().filter(|n| n.op_type == op_type && n.domain.is_empty() && n.outputs.len() == 1);
+    // `Op(a, b)` where one operand is the scalar constant `value` -> the other operand.
+    let with_scalar = |node: &Node<'_>, value: f32| -> Result<Option<String>> {
+        let [a, b] = node.inputs.as_slice() else { return Ok(None) };
+        for (x, c) in [(a, b), (b, a)] {
+            if scalar(c)?.is_some_and(|v| (v - value).abs() <= 1e-6 * value.abs()) {
+                return Ok(Some(x.to_string()));
+            }
+        }
+        Ok(None)
+    };
+    let mut gelus: Vec<(usize, String, String, [&str; 4])> = Vec::new();
+    for (index, half) in nodes.iter().enumerate() {
+        if half.op_type != "Mul" || !half.domain.is_empty() || replacements.contains_key(&index) {
+            continue;
+        }
+        let Some(product) = with_scalar(half, 0.5)? else { continue };
+        let Some(mul) = producer(&product, "Mul") else { continue };
+        let [a, b] = mul.inputs.as_slice() else { continue };
+        let found = [(a, b), (b, a)].into_iter().find_map(|(x, y)| {
+            let add = producer(y, "Add")?;
+            let erf_out = with_scalar(add, 1.0).ok()??;
+            let erf = producer(&erf_out, "Erf")?;
+            let div = producer(erf.inputs[0], "Div")?;
+            (div.inputs.len() == 2 && div.inputs[0] == *x && scalar(div.inputs[1]).ok()?.is_some_and(|v| (v - std::f32::consts::SQRT_2).abs() < 1e-6))
+                .then(|| (x.to_string(), [mul.outputs[0], add.outputs[0], erf.outputs[0], div.outputs[0]]))
+        });
+        let Some((x, intermediates)) = found else { continue };
+        // The intermediate values must only feed this GELU.
+        if intermediates.iter().any(|v| sole_consumer(v).is_none()) {
+            continue;
+        }
+        gelus.push((index, x, half.outputs[0].to_owned(), intermediates));
+    }
+    let gelu_intermediates: std::collections::HashSet<&str> = gelus.iter().flat_map(|g| g.3).collect();
+    for (index, node) in nodes.iter().enumerate() {
+        if node.outputs.len() == 1 && gelu_intermediates.contains(node.outputs[0]) {
+            replacements.insert(index, Vec::new());
+        }
+    }
+    for (index, x, output, _) in &gelus {
+        let mut e = Emitter::new(format!("stemgen_gelu{}", rewrites.gelu), &mut new_initializers, opset);
+        e.op_in(MS_DOMAIN, "Gelu", &[x], Some(output), &[]);
+        replacements.insert(*index, e.nodes);
+        rewrites.gelu += 1;
     }
 
     // Bottleneck 1-D Convs (HTDemucs' DConv residual branches: C -> C/8 -> 2C channels) ->
@@ -1139,6 +1337,16 @@ pub fn optimize_for_webgpu(model: &[u8]) -> Result<Option<(Vec<u8>, Rewrites)>> 
         } else {
             out.extend_from_slice(f.raw);
         }
+    }
+    let has_ms_opset = model_fields
+        .iter()
+        .filter(|f| f.num == model::OPSET_IMPORT)
+        .any(|f| parse(f.payload).is_ok_and(|o| read_str(&o, opset::DOMAIN) == MS_DOMAIN));
+    if rewrites.gelu > 0 && !has_ms_opset {
+        let mut ms_opset = Vec::new();
+        put_bytes(&mut ms_opset, opset::DOMAIN, MS_DOMAIN.as_bytes());
+        put_int(&mut ms_opset, opset::VERSION, 1);
+        put_bytes(&mut out, model::OPSET_IMPORT, &ms_opset);
     }
     Ok(Some((out, rewrites)))
 }
@@ -1402,6 +1610,64 @@ mod tests {
             let input: Vec<f32> = (0..n * cin * l).map(|i| pseudo(i, 10)).collect();
             let expected = run(&model, &input, &[n, cin, l], &["y"]);
             let actual = run(&patched, &input, &[n, cin, l], &["y"]);
+            assert_close(&expected[0], &actual[0], 1e-5);
+        }
+    }
+
+    #[test]
+    fn test_gelu_rewrite_matches_erf_gelu() {
+        let node = |op: &str, inputs: &[&str], output: &str| encode_node(op, &format!("/{output}"), inputs, &[output], &[]);
+        let nodes = [
+            constant("sqrt2", &[], &[std::f32::consts::SQRT_2]),
+            constant("one", &[], &[1.0]),
+            constant("half", &[], &[0.5]),
+            node("Div", &["x", "sqrt2"], "d"),
+            node("Erf", &["d"], "e"),
+            node("Add", &["e", "one"], "a"),
+            node("Mul", &["x", "a"], "m"),
+            node("Mul", &["m", "half"], "y"),
+        ];
+        let model = model(&nodes, ("x", &[None, None, None]), &[("y", &[None, None, None])]);
+        let (patched, rewrites) = optimize_for_webgpu(&model).unwrap().expect("model should be rewritten");
+        assert_eq!(rewrites, Rewrites { gelu: 1, ..Default::default() });
+        let input: Vec<f32> = (0..2 * 3 * 50).map(|i| 4.0 * pseudo(i, 11)).collect();
+        let expected = run(&model, &input, &[2, 3, 50], &["y"]);
+        let actual = run(&patched, &input, &[2, 3, 50], &["y"]);
+        assert_close(&expected[0], &actual[0], 1e-5);
+    }
+
+    #[test]
+    fn test_group_norm_affine_rewrite_matches() {
+        // x of rank 3 ([N, C, T], gamma [C, 1]) and rank 4 ([N, C, F, T], gamma [C, 1, 1]).
+        for dims in [vec![2usize, 6, 50], vec![2, 4, 3, 10]] {
+            let c = dims[1];
+            let affine_shape: Vec<i64> = std::iter::once(c as i64).chain(std::iter::repeat_n(1, dims.len() - 2)).collect();
+            let gamma: Vec<f32> = (0..c).map(|i| 0.5 + pseudo(i, 12)).collect();
+            let beta: Vec<f32> = (0..c).map(|i| pseudo(i, 13)).collect();
+            let node = |op: &str, inputs: &[&str], output: &str| encode_node(op, &format!("/{output}"), inputs, &[output], &[]);
+            let model = model(
+                &[
+                    constant_i64("shape", &[0, 1, -1]),
+                    constant("scale", &[1], &[1.0]),
+                    constant("bias", &[1], &[0.0]),
+                    constant("gamma", &affine_shape, &gamma),
+                    constant("beta", &affine_shape, &beta),
+                    node("Reshape", &["x", "shape"], "r"),
+                    node("InstanceNormalization", &["r", "scale", "bias"], "n"),
+                    node("Shape", &["x"], "x_shape"),
+                    node("Reshape", &["n", "x_shape"], "back"),
+                    node("Mul", &["back", "gamma"], "scaled"),
+                    node("Add", &["scaled", "beta"], "y"),
+                ],
+                ("x", &dims.iter().map(|d| Some(*d as i64)).collect::<Vec<_>>()),
+                &[("y", &dims.iter().map(|d| Some(*d as i64)).collect::<Vec<_>>())],
+            );
+            let (patched, rewrites) = optimize_for_webgpu(&model).unwrap().expect("model should be rewritten");
+            assert_eq!(rewrites, Rewrites { group_norm: 1, ..Default::default() });
+            let n: usize = dims.iter().product();
+            let input: Vec<f32> = (0..n).map(|i| 3.0 + pseudo(i, 14) * (1.0 + (i % 5) as f32)).collect();
+            let expected = run(&model, &input, &dims, &["y"]);
+            let actual = run(&patched, &input, &dims, &["y"]);
             assert_close(&expected[0], &actual[0], 1e-5);
         }
     }
