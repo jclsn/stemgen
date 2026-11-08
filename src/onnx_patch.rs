@@ -704,6 +704,111 @@ fn emit_group_norm(e: &mut Emitter, x: &str, scale: &str, bias: &str, output: &s
     }
 }
 
+// --- 1-D Conv -> shifted MatMuls ----------------------------------------------------------------
+
+fn round_up4(v: usize) -> usize {
+    v.div_ceil(4) * 4
+}
+
+/// A 1-D, stride-1, ungrouped `Conv` with constant weight (and bias).
+struct Conv1d<'a> {
+    input: &'a str,
+    output: &'a str,
+    /// `[Cout, Cin, K]`
+    weight: Vec<f32>,
+    bias: Option<Vec<f32>>,
+    cout: usize,
+    cin: usize,
+    kernel: usize,
+    dilation: usize,
+    pads: [usize; 2],
+}
+
+/// Emits `Conv1d(x[N, Cin, L])` as MatMuls on channels-last data, with channels zero-padded to
+/// multiples of 4 for WebGPU's vec4 MatMul.
+///
+/// WebGPU's Conv shader is very slow for HTDemucs' narrow DConv layers (e.g. 48 -> 6 -> 96
+/// channels: ~50-130 GFLOP/s, vs. 2-3 TFLOP/s for its MatMul). Same products, summed in a
+/// different order. Kernel taps are applied by shifting whichever side is narrower:
+/// - narrow output: one MatMul with all taps' weights side by side (`[Cin, K*Cout]`), then the
+///   tap outputs are shifted and summed;
+/// - otherwise: the (padded) input is shifted per tap and each shift multiplied by its tap.
+fn emit_conv1d_matmul(e: &mut Emitter, conv: &Conv1d) {
+    let (cin_p, cout_p, k) = (round_up4(conv.cin), round_up4(conv.cout), conv.kernel);
+    let [p0, p1] = conv.pads.map(|p| p as i64);
+    let span = (conv.dilation * (k - 1)) as i64;
+    let tap_weight = |j: usize, w: &mut [f32], row: usize, col0: usize| {
+        for co in 0..conv.cout {
+            for ci in 0..conv.cin {
+                w[ci * row + col0 + co] = conv.weight[(co * conv.cin + ci) * k + j];
+            }
+        }
+    };
+    // Rows [offset, offset + Lout) of axis 1 (from the end, as the length isn't known statically).
+    let shifted_end = |offset: i64| if offset == span { i64::MAX } else { offset - span };
+
+    let mut x = conv.input.to_owned();
+    let output_side = k > 1 && k * cout_p <= cin_p;
+    let (spatial_pad0, spatial_pad1) = if output_side { (0, 0) } else { (p0, p1) };
+    if spatial_pad0 != 0 || spatial_pad1 != 0 || cin_p != conv.cin {
+        x = e.pad(&x, &[0, 0, spatial_pad0, 0, (cin_p - conv.cin) as i64, spatial_pad1]);
+    }
+    let xt = e.transpose(&x, &[0, 2, 1]); // [N, L(+pads), Cin_p]
+
+    let mut y = if output_side {
+        let mut w = vec![0f32; cin_p * k * cout_p];
+        for j in 0..k {
+            tap_weight(j, &mut w, k * cout_p, j * cout_p);
+        }
+        let w = e.f32s("conv_weight", &[cin_p as i64, (k * cout_p) as i64], &w);
+        let taps = e.op("MatMul", &[&xt, &w], None, &[]); // [N, L, K*Cout_p]
+        let taps = if p0 != 0 || p1 != 0 { e.pad(&taps, &[0, p0, 0, 0, p1, 0]) } else { taps };
+        let mut acc: Option<String> = None;
+        for j in 0..k {
+            let offset = (j * conv.dilation) as i64;
+            let (starts, ends, axes) = (
+                e.i64s(&[offset, (j * cout_p) as i64]),
+                e.i64s(&[shifted_end(offset), ((j + 1) * cout_p) as i64]),
+                e.i64s(&[1, 2]),
+            );
+            let tap = e.op("Slice", &[&taps, &starts, &ends, &axes], None, &[]); // [N, Lout, Cout_p]
+            acc = Some(match acc {
+                None => tap,
+                Some(prev) => e.op("Add", &[&prev, &tap], None, &[]),
+            });
+        }
+        acc.unwrap()
+    } else {
+        let mut acc: Option<String> = None;
+        for j in 0..k {
+            let mut w = vec![0f32; cin_p * cout_p];
+            tap_weight(j, &mut w, cout_p, 0);
+            let w = e.f32s("conv_weight", &[cin_p as i64, cout_p as i64], &w);
+            let offset = (j * conv.dilation) as i64;
+            let shifted = if k == 1 { xt.clone() } else { e.slice(&xt, 1, offset, shifted_end(offset)) };
+            let product = e.op("MatMul", &[&shifted, &w], None, &[]); // [N, Lout, Cout_p]
+            acc = Some(match acc {
+                None => product,
+                Some(prev) => e.op("Add", &[&prev, &product], None, &[]),
+            });
+        }
+        acc.unwrap()
+    };
+    if let Some(bias) = &conv.bias {
+        let mut b = bias.clone();
+        b.resize(cout_p, 0.0);
+        let b = e.f32s("conv_bias", &[cout_p as i64], &b);
+        y = e.op("Add", &[&y, &b], None, &[]);
+    }
+    if cout_p == conv.cout {
+        e.op("Transpose", &[&y], Some(conv.output), &[("perm", Attr::Ints(&[0, 2, 1]))]);
+    } else {
+        let y = e.transpose(&y, &[0, 2, 1]); // [N, Cout_p, Lout]
+        let (starts, ends, axes) = (e.i64s(&[0]), e.i64s(&[conv.cout as i64]), e.i64s(&[1]));
+        e.op("Slice", &[&y, &starts, &ends, &axes], Some(conv.output), &[]);
+    }
+}
+
 // --- Matching ----------------------------------------------------------------------------------
 
 /// A 1-D, ungrouped, unpadded strided (transposed) convolution with a constant weight.
@@ -752,6 +857,51 @@ fn match_strided_conv<'a>(
     Ok(Some(StridedConv { input: node.inputs[0], output: node.outputs[0], weight, kernel, stride }))
 }
 
+fn match_conv1d<'a>(node: &Node<'a>, weights: &mut dyn FnMut(&str) -> Result<Option<FloatTensor<'a>>>) -> Result<Option<Conv1d<'a>>> {
+    if node.op_type != "Conv" || !node.domain.is_empty() || !(2..=3).contains(&node.inputs.len()) || node.outputs.len() != 1 {
+        return Ok(None);
+    }
+    let all_eq = |v: Option<Vec<i64>>, x: i64| v.is_none_or(|v| v.iter().all(|e| *e == x));
+    let Some(kernel) = node.attr_ints("kernel_shape")? else { return Ok(None) };
+    let [kernel] = kernel.as_slice() else { return Ok(None) };
+    let dilation = match node.attr_ints("dilations")?.as_deref() {
+        None => 1,
+        Some([d]) if *d >= 1 => *d,
+        _ => return Ok(None),
+    };
+    let pads = match node.attr_ints("pads")?.as_deref() {
+        None => [0, 0],
+        Some([a, b]) if *a >= 0 && *b >= 0 => [*a as usize, *b as usize],
+        _ => return Ok(None),
+    };
+    if node.attr_int("group").unwrap_or(1) != 1 || !all_eq(node.attr_ints("strides")?, 1) || node.attr_str("auto_pad").is_some_and(|p| p != "NOTSET") {
+        return Ok(None);
+    }
+    let Some(weight) = weights(node.inputs[1])? else { return Ok(None) };
+    let [cout, cin, k] = weight.dims.as_slice() else { return Ok(None) };
+    if *k != *kernel {
+        return Ok(None);
+    }
+    let bias = match node.inputs.get(2).filter(|b| !b.is_empty()) {
+        None => None,
+        Some(b) => match weights(b)? {
+            Some(t) if t.dims == [*cout] => Some(t.data.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()),
+            _ => return Ok(None),
+        },
+    };
+    Ok(Some(Conv1d {
+        input: node.inputs[0],
+        output: node.outputs[0],
+        weight: weight.data.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect(),
+        bias,
+        cout: *cout as usize,
+        cin: *cin as usize,
+        kernel: *k as usize,
+        dilation: dilation as usize,
+        pads,
+    }))
+}
+
 /// What [`optimize_for_webgpu`] rewrote.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Rewrites {
@@ -766,6 +916,8 @@ pub struct Rewrites {
     pub group_norm: usize,
     /// Multi-axis `ReduceMean`s split into single-axis ones.
     pub reduce_mean: usize,
+    /// Bottleneck 1-D Convs replaced by shifted MatMuls.
+    pub conv1d: usize,
 }
 
 impl Rewrites {
@@ -778,8 +930,8 @@ impl std::fmt::Display for Rewrites {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "STFT→FFT ×{}, iSTFT→FFT ×{}, iSTFT→MatMul ×{}, GroupNorm ×{}, ReduceMean ×{}",
-            self.stft_fft, self.istft_fft, self.istft_matmul, self.group_norm, self.reduce_mean
+            "STFT→FFT ×{}, iSTFT→FFT ×{}, iSTFT→MatMul ×{}, GroupNorm ×{}, ReduceMean ×{}, Conv1d ×{}",
+            self.stft_fft, self.istft_fft, self.istft_matmul, self.group_norm, self.reduce_mean, self.conv1d
         )
     }
 }
@@ -936,6 +1088,22 @@ pub fn optimize_for_webgpu(model: &[u8]) -> Result<Option<(Vec<u8>, Rewrites)>> 
         }
         replacements.insert(index, e.nodes);
         rewrites.reduce_mean += 1;
+    }
+
+    // Bottleneck 1-D Convs (HTDemucs' DConv residual branches: C -> C/8 -> 2C channels) ->
+    // shifted MatMuls. Convs with balanced channel counts run fine as Convs (no gain measured).
+    for (index, node) in nodes.iter().enumerate() {
+        if replacements.contains_key(&index) {
+            continue;
+        }
+        let Some(conv) = match_conv1d(node, &mut weight)? else { continue };
+        if conv.cin.max(conv.cout) < 4 * conv.cin.min(conv.cout) {
+            continue;
+        }
+        let mut e = Emitter::new(format!("stemgen_conv1d{}", rewrites.conv1d), &mut new_initializers, opset);
+        emit_conv1d_matmul(&mut e, &conv);
+        replacements.insert(index, e.nodes);
+        rewrites.conv1d += 1;
     }
 
     if rewrites.is_empty() {
@@ -1200,6 +1368,42 @@ mod tests {
         let actual = run(&patched, &input, &[n, c, h, w], &["y"]);
         assert_eq!(expected[0].len(), n);
         assert_close(&expected[0], &actual[0], 1e-5);
+    }
+
+    #[test]
+    fn test_conv1d_rewrite_matches_conv() {
+        let (n, l) = (3usize, 11usize);
+        // (cin, cout, kernel, dilation, pads, bias): DConv-like shapes plus odd channel counts.
+        // (48 -> 6, k=3) and (96 -> 6, k=3, uneven pads) shift outputs, (5 -> 23, k=3) shifts inputs.
+        for (cin, cout, k, d, pads, bias) in [
+            (48usize, 6usize, 3usize, 2usize, [2i64, 2i64], true),
+            (96, 6, 3, 1, [2, 0], true),
+            (6, 48, 1, 1, [0, 0], true),
+            (5, 23, 3, 1, [1, 0], false),
+        ] {
+            let weight: Vec<f32> = (0..cout * cin * k).map(|i| pseudo(i, 8)).collect();
+            let b: Vec<f32> = (0..cout).map(|i| pseudo(i, 9)).collect();
+            let mut inputs = vec!["x", "w"];
+            let mut nodes = vec![constant("w", &[cout as i64, cin as i64, k as i64], &weight)];
+            if bias {
+                nodes.push(constant("b", &[cout as i64], &b));
+                inputs.push("b");
+            }
+            nodes.push(encode_node(
+                "Conv",
+                "/Conv",
+                &inputs,
+                &["y"],
+                &[("kernel_shape", Attr::Ints(&[k as i64])), ("dilations", Attr::Ints(&[d as i64])), ("pads", Attr::Ints(&pads))],
+            ));
+            let model = model(&nodes, ("x", &[None, Some(cin as i64), None]), &[("y", &[None, Some(cout as i64), None])]);
+            let (patched, rewrites) = optimize_for_webgpu(&model).unwrap().expect("model should be rewritten");
+            assert_eq!(rewrites, Rewrites { conv1d: 1, ..Default::default() });
+            let input: Vec<f32> = (0..n * cin * l).map(|i| pseudo(i, 10)).collect();
+            let expected = run(&model, &input, &[n, cin, l], &["y"]);
+            let actual = run(&patched, &input, &[n, cin, l], &["y"]);
+            assert_close(&expected[0], &actual[0], 1e-5);
+        }
     }
 
     #[test]
