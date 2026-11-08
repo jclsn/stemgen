@@ -6,6 +6,7 @@ compile_error!("the `cuda` and `webgpu` features cannot be combined with `downlo
 pub mod constant;
 pub mod demucs;
 pub mod nistem;
+pub mod onnx_patch;
 pub mod track;
 
 #[cfg(test)]

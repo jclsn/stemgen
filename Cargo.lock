@@ -1013,7 +1013,9 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "taglib",
+ "ureq",
 ]
 
 [[package]]

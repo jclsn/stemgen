@@ -115,6 +115,41 @@ impl Default for DemusOpts {
     }
 }
 
+/// Downloads `url` into ort's model cache (the same location `commit_from_url` uses) and returns
+/// the cached path, so models can be read and patched before the session is created.
+#[cfg(feature = "webgpu")]
+fn fetch_model(url: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let dir = ort::sys::internal::dirs::cache_dir().ok_or("could not determine cache directory")?.join("models");
+    std::fs::create_dir_all(&dir)?;
+    let filename = Sha256::digest(url).iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    });
+    let path = dir.join(&filename);
+    if path.exists() {
+        return Ok(path);
+    }
+
+    eprintln!("[DEMUCS] Downloading model to {:?}", path);
+    let tmp = dir.join(format!("tmp_{}.{filename}", std::process::id()));
+    let agent = ureq::Agent::config_builder()
+        .tls_config(ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build())
+        .build()
+        .new_agent();
+    let mut reader = agent.get(url).call()?.into_body().into_with_config().limit(u64::MAX).reader();
+    let result = std::fs::File::create(&tmp)
+        .and_then(|mut f| std::io::copy(&mut reader, &mut f))
+        .and_then(|_| std::fs::rename(&tmp, &path));
+    if let Err(err) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(path)
+}
+
 impl Demucs {
     pub fn new_from_file(model: &Model, ops: DemusOpts) -> Result<Self, Box<dyn std::error::Error>> {
         eprintln!("[DEMUCS] Creating new Demucs instance with device: {}", ops.device);
@@ -178,12 +213,37 @@ impl Demucs {
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(ops.threads)?;
 
-        let session = match model {
-            Model::Local(path) => {
+        let session = match (model, ops.device) {
+            #[cfg(feature = "webgpu")]
+            (model, Device::WebGPU) => {
+                let path = match model {
+                    Model::Local(path) => path.clone(),
+                    Model::Url(url) => {
+                        eprintln!("[DEMUCS] Loading model from URL: {}", url);
+                        fetch_model(url)?
+                    }
+                };
+                eprintln!("[DEMUCS] Loading model from local path: {:?}", path);
+                let bytes = std::fs::read(&path)?;
+                let patch_start = Instant::now();
+                match crate::onnx_patch::rewrite_istft_conv_transpose(&bytes) {
+                    Ok(Some(patched)) => {
+                        eprintln!("[DEMUCS] Rewrote iSTFT ConvTranspose for WebGPU in {:?}", patch_start.elapsed());
+                        drop(bytes);
+                        session.commit_from_memory(&patched)
+                    }
+                    Ok(None) => session.commit_from_memory(&bytes),
+                    Err(err) => {
+                        eprintln!("[DEMUCS] Unable to rewrite the model ({err}), loading it unchanged");
+                        session.commit_from_memory(&bytes)
+                    }
+                }
+            },
+            (Model::Local(path), _) => {
                 eprintln!("[DEMUCS] Loading model from local path: {:?}", path);
                 session.commit_from_file(path)
             },
-            Model::Url(url) => {
+            (Model::Url(url), _) => {
                 eprintln!("[DEMUCS] Loading model from URL: {}", url);
                 session.commit_from_url(url)
             },

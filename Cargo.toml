@@ -32,6 +32,10 @@ taglib = { git = "https://github.com/acolombier/taglib-rust.git", tag = "v2.1.1"
   "use-pkgconfig"
 ] }
 
+# Used to fetch the model into ort's cache when it has to be patched before loading.
+sha2 = { version = "0.10", optional = true }
+ureq = { version = "3.1", default-features = false, features = ["native-tls"], optional = true }
+
 [dependencies.chrono]
 version = "0.4.41"
 optional = true
@@ -43,6 +47,6 @@ default = ["download-binaries"]
 download-binaries = ["ort/download-binaries"]
 cuda = ["ort/cuda"]
 migraphx = ["ort/migraphx", "ort/pkg-config"]
-webgpu = ["ort/webgpu", "download-binaries"]
+webgpu = ["ort/webgpu", "download-binaries", "dep:sha2", "dep:ureq"]
 
 benchmark = ["chrono"]
