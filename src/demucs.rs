@@ -226,9 +226,9 @@ impl Demucs {
                 eprintln!("[DEMUCS] Loading model from local path: {:?}", path);
                 let bytes = std::fs::read(&path)?;
                 let patch_start = Instant::now();
-                match crate::onnx_patch::rewrite_istft_conv_transpose(&bytes) {
-                    Ok(Some(patched)) => {
-                        eprintln!("[DEMUCS] Rewrote iSTFT ConvTranspose for WebGPU in {:?}", patch_start.elapsed());
+                match crate::onnx_patch::optimize_for_webgpu(&bytes) {
+                    Ok(Some((patched, rewrites))) => {
+                        eprintln!("[DEMUCS] Rewrote the model for WebGPU ({rewrites}) in {:?}", patch_start.elapsed());
                         drop(bytes);
                         session.commit_from_memory(&patched)
                     }

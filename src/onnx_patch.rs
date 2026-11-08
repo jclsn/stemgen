@@ -1,9 +1,10 @@
 //! In-memory ONNX graph rewrites that work around slow kernels in some execution providers.
 //!
-//! HTDemucs implements its iSTFT as a 1-D `ConvTranspose` with a huge kernel (4096) and stride
-//! (1024). ONNX Runtime's WebGPU kernel for that shape is pathologically slow (~85% of the whole
-//! inference time), so [`rewrite_istft_conv_transpose`] replaces it with the equivalent
-//! `MatMul` + overlap-add, which maps onto WebGPU's fast matrix multiplication shader.
+//! HTDemucs implements its STFT as a pair of strided 1-D `Conv`s and its iSTFT as a strided
+//! `ConvTranspose`, all with dense 4096-point DFT matrices. ONNX Runtime's WebGPU kernels for those
+//! shapes are slow (the `ConvTranspose` alone took ~85% of the inference time), so
+//! [`optimize_for_webgpu`] replaces them with FFTs built from small MatMuls (~15x fewer FLOPs),
+//! after checking that the weights really are a windowed DFT basis.
 //!
 //! Only the protobuf messages that need to change are decoded; everything else (including the
 //! ~300MB of weights) is copied through as raw bytes.
@@ -160,6 +161,7 @@ mod attr {
     pub const T: u32 = 5;
     pub const INTS: u32 = 8;
     pub const TYPE: u32 = 20;
+    pub const TYPE_INT: i64 = 2;
     pub const TYPE_INTS: i64 = 7;
 }
 mod tensor {
@@ -176,7 +178,6 @@ mod tensor {
 struct Node<'a> {
     inputs: Vec<&'a str>,
     outputs: Vec<&'a str>,
-    name: &'a str,
     op_type: &'a str,
     domain: &'a str,
     attributes: Vec<Vec<Field<'a>>>,
@@ -188,7 +189,6 @@ impl<'a> Node<'a> {
         Ok(Self {
             inputs: read_strs(&fields, node::INPUT),
             outputs: read_strs(&fields, node::OUTPUT),
-            name: read_str(&fields, node::NAME),
             op_type: read_str(&fields, node::OP_TYPE),
             domain: read_str(&fields, node::DOMAIN),
             attributes: fields
@@ -263,7 +263,13 @@ fn encode_tensor(name: &str, data_type: i64, dims: &[i64], raw_data: &[u8]) -> V
     out
 }
 
-fn encode_node(op_type: &str, name: &str, inputs: &[&str], outputs: &[&str], ints_attrs: &[(&str, &[i64])]) -> Vec<u8> {
+/// An attribute for [`encode_node`]: a list of ints, or a single int.
+enum Attr<'a> {
+    Ints(&'a [i64]),
+    Int(i64),
+}
+
+fn encode_node(op_type: &str, name: &str, inputs: &[&str], outputs: &[&str], attrs: &[(&str, Attr)]) -> Vec<u8> {
     let mut out = Vec::new();
     for i in inputs {
         put_bytes(&mut out, node::INPUT, i.as_bytes());
@@ -273,32 +279,379 @@ fn encode_node(op_type: &str, name: &str, inputs: &[&str], outputs: &[&str], int
     }
     put_bytes(&mut out, node::NAME, name.as_bytes());
     put_bytes(&mut out, node::OP_TYPE, op_type.as_bytes());
-    for (attr_name, values) in ints_attrs {
+    for (attr_name, value) in attrs {
         let mut a = Vec::new();
         put_bytes(&mut a, attr::NAME, attr_name.as_bytes());
-        for v in *values {
-            put_int(&mut a, attr::INTS, *v);
+        match value {
+            Attr::Ints(values) => {
+                for v in *values {
+                    put_int(&mut a, attr::INTS, *v);
+                }
+                put_int(&mut a, attr::TYPE, attr::TYPE_INTS);
+            }
+            Attr::Int(v) => {
+                put_int(&mut a, attr::I, *v);
+                put_int(&mut a, attr::TYPE, attr::TYPE_INT);
+            }
         }
-        put_int(&mut a, attr::TYPE, attr::TYPE_INTS);
         put_bytes(&mut out, node::ATTRIBUTE, &a);
     }
     out
 }
 
-// --- The rewrite ------------------------------------------------------------------------------
 
-/// The parts of a matching `ConvTranspose` needed to rewrite it.
-struct IstftConv<'a> {
+// --- Graph building -----------------------------------------------------------------------------
+
+/// Accumulates the nodes and initializers of one replacement subgraph, with unique names.
+struct Emitter<'a> {
+    prefix: String,
+    nodes: Vec<Vec<u8>>,
+    initializers: &'a mut Vec<Vec<u8>>,
+    counter: usize,
+}
+
+impl<'a> Emitter<'a> {
+    fn new(prefix: String, initializers: &'a mut Vec<Vec<u8>>) -> Self {
+        Self { prefix, nodes: Vec::new(), initializers, counter: 0 }
+    }
+
+    fn name(&mut self, what: &str) -> String {
+        self.counter += 1;
+        format!("{}/{what}_{}", self.prefix, self.counter)
+    }
+
+    fn i64s(&mut self, values: &[i64]) -> String {
+        let name = self.name("const");
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.initializers.push(encode_tensor(&name, tensor::INT64, &[values.len() as i64], &bytes));
+        name
+    }
+
+    fn f32s(&mut self, what: &str, dims: &[i64], values: &[f32]) -> String {
+        let name = self.name(what);
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.initializers.push(encode_tensor(&name, tensor::FLOAT, dims, &bytes));
+        name
+    }
+
+    fn raw_f32(&mut self, what: &str, dims: &[i64], bytes: &[u8]) -> String {
+        let name = self.name(what);
+        self.initializers.push(encode_tensor(&name, tensor::FLOAT, dims, bytes));
+        name
+    }
+
+    /// Adds a node; `output` names its result, or `None` for a fresh internal name.
+    fn op(&mut self, op_type: &str, inputs: &[&str], output: Option<&str>, attrs: &[(&str, Attr)]) -> String {
+        let out = output.map(str::to_owned).unwrap_or_else(|| self.name(op_type));
+        let name = self.name(op_type);
+        self.nodes.push(encode_node(op_type, &name, inputs, &[&out], attrs));
+        out
+    }
+
+    fn reshape(&mut self, x: &str, shape: &[i64]) -> String {
+        let shape = self.i64s(shape);
+        self.op("Reshape", &[x, &shape], None, &[])
+    }
+
+    fn transpose(&mut self, x: &str, perm: &[i64]) -> String {
+        self.op("Transpose", &[x], None, &[("perm", Attr::Ints(perm))])
+    }
+
+    fn slice(&mut self, x: &str, axis: i64, start: i64, end: i64) -> String {
+        let (starts, ends, axes) = (self.i64s(&[start]), self.i64s(&[end]), self.i64s(&[axis]));
+        self.op("Slice", &[x, &starts, &ends, &axes], None, &[])
+    }
+
+    fn pad(&mut self, x: &str, pads: &[i64]) -> String {
+        let pads = self.i64s(pads);
+        self.op("Pad", &[x, &pads], None, &[])
+    }
+
+    /// Overlap-adds `segments` (each `[N, L, S]`, segment `j` delayed by `j*S` samples) into
+    /// `output` (`[N, 1, (L + R - 1) * S]`).
+    fn overlap_add(&mut self, segments: &[String], stride: i64, output: &str) {
+        let r = segments.len() as i64;
+        let mut acc: Option<String> = None;
+        for (j, seg) in segments.iter().enumerate() {
+            let j = j as i64;
+            let flat = self.reshape(seg, &[0, 1, -1]); // [N, 1, L*S]
+            let padded = self.pad(&flat, &[0, 0, j * stride, 0, 0, (r - 1 - j) * stride]);
+            acc = Some(match acc {
+                None => padded,
+                Some(prev) => self.op("Add", &[&prev, &padded], (j == r - 1).then_some(output), &[]),
+            });
+        }
+        if r == 1 {
+            self.op("Identity", &[acc.as_deref().unwrap()], Some(output), &[]);
+        }
+    }
+}
+
+// --- Recognizing (windowed) DFT weights --------------------------------------------------------
+
+/// Max deviation of the weights from the fitted DFT basis, relative to the largest weight.
+/// HTDemucs' exported STFT weights are off by up to ~8e-4 (float32 rounding when they were
+/// computed); anything that isn't a DFT basis is off by O(1).
+const DFT_FIT_TOLERANCE: f64 = 5e-3;
+
+/// `cos_rows[k][n] = cos_scale[k] * window[n] * cos(2πkn/K)` and
+/// `sin_rows[k][n] = sin_scale[k] * window[n] * sin(2πkn/K)`, for `k` in `0..=K/2`.
+struct DftFit {
+    window: Vec<f64>,
+    cos_scale: Vec<f64>,
+    sin_scale: Vec<f64>,
+}
+
+fn trig_tables(k: usize) -> (Vec<f64>, Vec<f64>) {
+    (0..k).map(|m| (std::f64::consts::TAU * m as f64 / k as f64).sin_cos()).map(|(s, c)| (c, s)).unzip()
+}
+
+fn fit_windowed_dft(cos_rows: &[f32], sin_rows: &[f32], k: usize) -> Option<DftFit> {
+    let bins = k / 2 + 1;
+    if cos_rows.len() != bins * k || sin_rows.len() != bins * k {
+        return None;
+    }
+    let window: Vec<f64> = cos_rows[..k].iter().map(|v| f64::from(*v)).collect();
+    let peak = cos_rows.iter().chain(sin_rows).fold(0f64, |m, v| m.max(f64::from(v.abs())));
+    if peak == 0.0 {
+        return None;
+    }
+    let (cos_t, sin_t) = trig_tables(k);
+    let fit = |rows: &[f32], table: &[f64]| -> Option<Vec<f64>> {
+        let mut scales = Vec::with_capacity(bins);
+        let mut basis = vec![0f64; k];
+        for (r, row) in rows.chunks_exact(k).enumerate() {
+            // basis[n] = window[n] * table[r*n mod K], stepping the angle index by r.
+            let mut m = 0;
+            for (n, b) in basis.iter_mut().enumerate() {
+                *b = window[n] * table[m];
+                m += r;
+                if m >= k {
+                    m -= k;
+                }
+            }
+            let (mut num, mut den) = (0.0, 0.0);
+            for (w, b) in row.iter().zip(&basis) {
+                num += f64::from(*w) * b;
+                den += b * b;
+            }
+            // sin rows 0 and K/2 are identically zero.
+            let scale = if den > 1e-12 * peak * peak { num / den } else { 0.0 };
+            if row.iter().zip(&basis).any(|(w, b)| (f64::from(*w) - scale * b).abs() > DFT_FIT_TOLERANCE * peak) {
+                return None;
+            }
+            scales.push(scale);
+        }
+        Some(scales)
+    };
+    Some(DftFit { cos_scale: fit(cos_rows, &cos_t)?, sin_scale: fit(sin_rows, &sin_t)?, window })
+}
+
+/// Splits a K-point DFT into P x Q (Cooley-Tukey) with P = Q = sqrt(K), both even.
+fn fft_split(k: usize) -> Option<(usize, usize)> {
+    let p = (k as f64).sqrt().round() as usize;
+    (k >= 64 && p * p == k && p % 2 == 0).then_some((p, p))
+}
+
+fn even_ceil(v: usize) -> usize {
+    v + v % 2
+}
+
+// --- STFT: a pair of strided Conv nodes -> FFT -------------------------------------------------
+
+/// Emits the real/imaginary STFT (`Conv(x[N, 1, T], W[K/2+1, 1, K], stride S)` with windowed
+/// cos/sin bases) as framing + a P x Q FFT made of two MatMuls.
+///
+/// With `n = Q*n1 + n2` and `k = k1 + P*k2`:
+/// `X[k] = Σ_n2 e^(-2πi k2 n2/Q) · [e^(-2πi k1 n2/K) Σ_n1 w[n] x[n] e^(-2πi k1 n1/P)]`.
+/// The window and the twiddle factors are folded into the first MatMul's (per-n2) weights.
+fn emit_stft_fft(e: &mut Emitter, input: &str, cos_out: &str, sin_out: &str, k: usize, s: usize, fit: &DftFit) {
+    let (p, q) = fft_split(k).unwrap();
+    let (bins, r) = (k / 2 + 1, k / s);
+    let (pi, qi) = (p as i64, q as i64);
+    let (cos_t, sin_t) = trig_tables(k);
+
+    // Frames [N, L, K]: frame l is blocks l..l+R of the signal cut into hop-sized blocks.
+    let blocks = e.reshape(input, &[0, -1, s as i64]); // [N, L+R-1, S]
+    let segments: Vec<String> = (0..r as i64)
+        .map(|j| e.slice(&blocks, 1, j, if j == r as i64 - 1 { i64::MAX } else { j - (r as i64 - 1) }))
+        .collect();
+    let frames = if r == 1 {
+        segments[0].clone()
+    } else {
+        let refs: Vec<&str> = segments.iter().map(String::as_str).collect();
+        e.op("Concat", &refs, None, &[("axis", Attr::Int(2))])
+    };
+
+    // Stage 1, per n2: contract n1 with window * twiddle * e^(-2πi k1 n1/P) -> [Q, N, L, (re|im) k1].
+    let mut w1 = vec![0f32; q * p * 2 * p];
+    for n2 in 0..q {
+        for n1 in 0..p {
+            let window = fit.window[q * n1 + n2];
+            for k1 in 0..p {
+                let m = (q * k1 * n1 + k1 * n2) % k;
+                let base = (n2 * p + n1) * 2 * p;
+                w1[base + k1] = (window * cos_t[m]) as f32;
+                w1[base + p + k1] = (-window * sin_t[m]) as f32;
+            }
+        }
+    }
+    let w1 = e.f32s("stft_stage1", &[qi, 1, pi, 2 * pi], &w1);
+    let f4 = e.reshape(&frames, &[0, 0, pi, qi]); // [N, L, P(n1), Q(n2)]
+    let ft = e.transpose(&f4, &[3, 0, 1, 2]); // [Q(n2), N, L, P(n1)]
+    let b = e.op("MatMul", &[&ft, &w1], None, &[]); // [Q(n2), N, L, 2P]
+    let b5 = e.reshape(&b, &[0, 0, 0, 2, pi]); // [Q(n2), N, L, 2, P(k1)]
+    let bt = e.transpose(&b5, &[1, 2, 4, 3, 0]); // [N, L, P(k1), 2, Q(n2)]
+    let b4 = e.reshape(&bt, &[0, 0, 0, -1]); // [N, L, P(k1), (re|im) n2]
+
+    // Stage 2: complex contraction over n2 with e^(-2πi k2 n2/Q), only for the k2 that reach
+    // k <= K/2 (padded to an even count so the MatMul stays vec4-aligned).
+    let k2c = even_ceil(q / 2 + 1);
+    let mut m3 = vec![0f32; 2 * q * 2 * k2c];
+    for n2 in 0..q {
+        for k2 in 0..k2c {
+            let m = (p * k2 * n2) % k;
+            let (gr, gi) = (cos_t[m] as f32, -sin_t[m] as f32);
+            m3[n2 * 2 * k2c + k2] = gr;
+            m3[n2 * 2 * k2c + k2c + k2] = gi;
+            m3[(q + n2) * 2 * k2c + k2] = -gi;
+            m3[(q + n2) * 2 * k2c + k2c + k2] = gr;
+        }
+    }
+    let m3 = e.f32s("stft_stage2", &[2 * qi, 2 * k2c as i64], &m3);
+    let c = e.op("MatMul", &[&b4, &m3], None, &[]); // [N, L, P(k1), (re|im) k2]
+    let c5 = e.reshape(&c, &[0, 0, 0, 2, k2c as i64]); // [N, L, P(k1), 2, K2c(k2)]
+    let ct = e.transpose(&c5, &[3, 0, 4, 2, 1]); // [2, N, K2c(k2), P(k1), L]
+    let spectrum = e.reshape(&ct, &[0, 0, (k2c * p) as i64, -1]); // [2, N, k = k1 + P*k2, L]
+    let spectrum = e.slice(&spectrum, 2, 0, bins as i64); // [2, N, K/2+1, L]
+
+    // Re X = cos_scale * Re F, and the sin conv computes sin_scale * Σ w x sin = -sin_scale * Im F.
+    let axis0 = e.i64s(&[0]);
+    for (part, out, scale) in [(0, cos_out, &fit.cos_scale), (1, sin_out, &fit.sin_scale)] {
+        let sign = if part == 0 { 1.0 } else { -1.0 };
+        let scale: Vec<f32> = scale.iter().map(|v| (sign * v) as f32).collect();
+        let scale = e.f32s("stft_scale", &[bins as i64, 1], &scale);
+        let half = e.slice(&spectrum, 0, part, part + 1);
+        let half = e.op("Squeeze", &[&half, &axis0], None, &[]); // [N, K/2+1, L]
+        e.op("Mul", &[&half, &scale], Some(out), &[]);
+    }
+}
+
+// --- iSTFT: a strided ConvTranspose -> inverse FFT + overlap-add -------------------------------
+
+/// Emits the inverse STFT (`ConvTranspose(X[N, 2*(K/2+1), L], W, stride S)` where W holds the
+/// windowed cos rows then the sin rows) as a P x Q inverse FFT made of two MatMuls, followed by
+/// overlap-add.
+///
+/// `frame[n] = w[n] · Re Σ_k Z[k] e^(2πi kn/K)` with `Z[k] = cos_scale[k]·Xr[k] - i·sin_scale[k]·Xi[k]`;
+/// with `k = Q*k1 + k2` and `n = n1 + P*n2` the sum factors into a contraction over k1 and a
+/// (per-n1, twiddle- and window-folded) contraction over k2.
+fn emit_istft_fft(e: &mut Emitter, input: &str, output: &str, k: usize, s: usize, fit: &DftFit) {
+    let (p, q) = fft_split(k).unwrap();
+    let (bins, r) = (k / 2 + 1, k / s);
+    let (pi, qi) = (p as i64, q as i64);
+    let (cos_t, sin_t) = trig_tables(k);
+    let k1c = even_ceil(p / 2 + 1); // k1 values needed for k <= K/2, kept even for vec4
+
+    let scale: Vec<f32> = fit.cos_scale.iter().map(|v| *v as f32).chain(fit.sin_scale.iter().map(|v| -*v as f32)).collect();
+    let scale = e.f32s("istft_scale", &[2 * bins as i64, 1], &scale);
+    let z = e.op("Mul", &[input, &scale], None, &[]); // [N, 2*bins, L]
+    let z = e.reshape(&z, &[0, 2, bins as i64, -1]); // [N, 2, bins, L]
+    let z = e.pad(&z, &[0, 0, 0, 0, 0, 0, (k1c * q - bins) as i64, 0]); // [N, 2, K1c*Q, L]
+    let z = e.reshape(&z, &[0, 0, k1c as i64, qi, -1]); // [N, 2, K1c(k1), Q(k2), L]
+    let z = e.transpose(&z, &[0, 4, 3, 1, 2]); // [N, L, Q(k2), 2, K1c(k1)]
+    let z = e.reshape(&z, &[0, 0, 0, -1]); // [N, L, Q(k2), (re|im) k1]
+
+    // Stage 1: complex contraction over k1 with e^(2πi k1 n1/P).
+    let mut ma = vec![0f32; 2 * k1c * 2 * p];
+    for k1 in 0..k1c {
+        for n1 in 0..p {
+            let m = (q * k1 * n1) % k;
+            let (hr, hi) = (cos_t[m] as f32, sin_t[m] as f32);
+            ma[k1 * 2 * p + n1] = hr;
+            ma[k1 * 2 * p + p + n1] = hi;
+            ma[(k1c + k1) * 2 * p + n1] = -hi;
+            ma[(k1c + k1) * 2 * p + p + n1] = hr;
+        }
+    }
+    let ma = e.f32s("istft_stage1", &[2 * k1c as i64, 2 * pi], &ma);
+    let a = e.op("MatMul", &[&z, &ma], None, &[]); // [N, L, Q(k2), (re|im) n1]
+    let a = e.reshape(&a, &[0, 0, 0, 2, pi]); // [N, L, Q(k2), 2, P(n1)]
+    let a = e.transpose(&a, &[4, 0, 1, 3, 2]); // [P(n1), N, L, 2, Q(k2)]
+    let a = e.reshape(&a, &[0, 0, 0, -1]); // [P(n1), N, L, (re|im) k2]
+
+    // Stage 2, per n1: real part of the contraction over k2 with window * twiddle * e^(2πi k2 n2/Q).
+    let mut wc = vec![0f32; p * 2 * q * q];
+    for n1 in 0..p {
+        for k2 in 0..q {
+            for n2 in 0..q {
+                let m = (k2 * n1 + p * k2 * n2) % k;
+                let window = fit.window[n1 + p * n2];
+                wc[(n1 * 2 * q + k2) * q + n2] = (window * cos_t[m]) as f32;
+                wc[(n1 * 2 * q + q + k2) * q + n2] = (-window * sin_t[m]) as f32;
+            }
+        }
+    }
+    let wc = e.f32s("istft_stage2", &[pi, 1, 2 * qi, qi], &wc);
+    let y = e.op("MatMul", &[&a, &wc], None, &[]); // [P(n1), N, L, Q(n2)]
+    let y = e.transpose(&y, &[1, 2, 3, 0]); // [N, L, Q(n2), P(n1)]
+    let frames = e.reshape(&y, &[0, 0, -1]); // [N, L, K], n = n1 + P*n2
+
+    let segments: Vec<String> = (0..r as i64).map(|j| e.slice(&frames, 2, j * s as i64, (j + 1) * s as i64)).collect();
+    e.overlap_add(&segments, s as i64, output);
+}
+
+// --- iSTFT fallback: ConvTranspose -> MatMul + overlap-add -------------------------------------
+
+/// Emits `ConvTranspose(X[N, Cin, L], W[Cin, 1, K], stride S)` as
+/// `overlap_add(Transpose(X) @ W[:, 0, :], hop = S)`, for weights that aren't a DFT basis.
+fn emit_matmul_overlap_add(e: &mut Emitter, input: &str, output: &str, weight: &FloatTensor, k: i64, s: i64) {
+    let cin = weight.dims[0];
+    let r = k / s;
+
+    // Zero-pad Cin to a multiple of 4 so WebGPU picks its vectorized (vec4) MatMul shader.
+    let cpad = (4 - cin % 4) % 4;
+    let x = if cpad != 0 { e.pad(input, &[0, 0, 0, 0, cpad, 0]) } else { input.to_owned() };
+    let xt = e.transpose(&x, &[0, 2, 1]); // [N, L, Cin]
+
+    // One MatMul per hop-sized slice of the kernel: slice j of every frame is exactly the part
+    // that lands j*S samples later in the overlap-add. Splitting also keeps each weight small:
+    // a single [Cin, K] weight (~67MB for HTDemucs) is sometimes placed where WebGPU reads it
+    // ~15x slower, especially on GPUs without resizable BAR.
+    let w = &weight.data; // [Cin, 1, K] == [Cin, K] in row-major order
+    let row = (k * 4) as usize;
+    let segments: Vec<String> = (0..r)
+        .map(|j| {
+            let mut wj = Vec::with_capacity(((cin + cpad) * s * 4) as usize);
+            for c in 0..cin as usize {
+                let start = c * row + (j * s * 4) as usize;
+                wj.extend_from_slice(&w[start..start + (s * 4) as usize]);
+            }
+            wj.resize(((cin + cpad) * s * 4) as usize, 0);
+            let wj = e.raw_f32("weight", &[cin + cpad, s], &wj);
+            e.op("MatMul", &[&xt, &wj], None, &[]) // [N, L, S]
+        })
+        .collect();
+    e.overlap_add(&segments, s, output);
+}
+
+// --- Matching ----------------------------------------------------------------------------------
+
+/// A 1-D, ungrouped, unpadded strided (transposed) convolution with a constant weight.
+struct StridedConv<'a> {
     input: &'a str,
     output: &'a str,
-    name: &'a str,
     weight: FloatTensor<'a>,
     kernel: i64,
     stride: i64,
 }
 
-fn match_istft_conv<'a>(node: &Node<'a>, weights: &mut dyn FnMut(&str) -> Result<Option<FloatTensor<'a>>>) -> Result<Option<IstftConv<'a>>> {
-    if node.op_type != "ConvTranspose" || !node.domain.is_empty() || node.inputs.len() != 2 || node.outputs.len() != 1 {
+fn match_strided_conv<'a>(
+    node: &Node<'a>,
+    op_type: &str,
+    weights: &mut dyn FnMut(&str) -> Result<Option<FloatTensor<'a>>>,
+) -> Result<Option<StridedConv<'a>>> {
+    if node.op_type != op_type || !node.domain.is_empty() || node.inputs.len() != 2 || node.outputs.len() != 1 {
         return Ok(None);
     }
     let all_eq = |v: Option<Vec<i64>>, x: i64| v.is_none_or(|v| v.iter().all(|e| *e == x));
@@ -315,7 +668,7 @@ fn match_istft_conv<'a>(node: &Node<'a>, weights: &mut dyn FnMut(&str) -> Result
         || !all_eq(node.attr_ints("output_padding")?, 0)
         || node.attr("output_shape").is_some()
         || node.attr_str("auto_pad").is_some_and(|p| p != "NOTSET")
-        // Only worth it for large strides (the iSTFT case), where the frames barely overlap.
+        // Only worth it for large strides (the STFT case), where frames barely overlap.
         || stride < 64
         || kernel % stride != 0
     {
@@ -327,80 +680,41 @@ fn match_istft_conv<'a>(node: &Node<'a>, weights: &mut dyn FnMut(&str) -> Result
     if weight.dims.len() != 3 || weight.dims[1] != 1 || weight.dims[2] != kernel {
         return Ok(None);
     }
-    Ok(Some(IstftConv { input: node.inputs[0], output: node.outputs[0], name: node.name, weight, kernel, stride }))
+    Ok(Some(StridedConv { input: node.inputs[0], output: node.outputs[0], weight, kernel, stride }))
 }
 
-/// Emits nodes and initializers computing
-/// `ConvTranspose(X[N, Cin, L], W[Cin, 1, K], stride S)` as
-/// `overlap_add(Transpose(X) @ W[:, 0, :], hop = S)`.
-fn emit_matmul_overlap_add(conv: &IstftConv, prefix: &str, nodes: &mut Vec<Vec<u8>>, initializers: &mut Vec<Vec<u8>>) {
-    let (cin, k, s) = (conv.weight.dims[0], conv.kernel, conv.stride);
-    let r = k / s;
-    let name = |suffix: &str| format!("{prefix}/{suffix}");
-    let int64 = |initializers: &mut Vec<Vec<u8>>, suffix: &str, values: &[i64]| {
-        let n = name(suffix);
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        initializers.push(encode_tensor(&n, tensor::INT64, &[values.len() as i64], &bytes));
-        n
-    };
+/// What [`optimize_for_webgpu`] rewrote.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Rewrites {
+    /// STFT `Conv` pairs replaced by an FFT.
+    pub stft_fft: usize,
+    /// iSTFT `ConvTranspose` nodes replaced by an inverse FFT + overlap-add.
+    pub istft_fft: usize,
+    /// Large-stride `ConvTranspose` nodes replaced by MatMul + overlap-add.
+    pub istft_matmul: usize,
+}
 
-    // Zero-pad Cin to a multiple of 4 so WebGPU picks its vectorized (vec4) MatMul shader.
-    let cpad = (4 - cin % 4) % 4;
-    let mut x = conv.input.to_owned();
-    if cpad != 0 {
-        let pads = int64(initializers, "pad_channels", &[0, 0, 0, 0, cpad, 0]);
-        let out = name("x_padded");
-        nodes.push(encode_node("Pad", &name("PadChannels"), &[&x, &pads], &[&out], &[]));
-        x = out;
-    }
-    let xt = name("x_t");
-    nodes.push(encode_node("Transpose", &name("TransposeX"), &[&x], &[&xt], &[("perm", &[0, 2, 1])])); // [N, L, Cin]
-    let flat = int64(initializers, "shape_flat", &[0, 1, -1]);
-
-    // One MatMul per hop-sized slice of the kernel: slice j of every frame is exactly the part
-    // that lands j*S samples later in the overlap-add. Splitting also keeps each weight small:
-    // a single [Cin, K] weight (~67MB for HTDemucs) is sometimes placed where WebGPU reads it
-    // ~15x slower, especially on GPUs without resizable BAR.
-    let w = &conv.weight.data; // [Cin, 1, K] == [Cin, K] in row-major order
-    let row = (k * 4) as usize;
-    let mut acc: Option<String> = None;
-    for j in 0..r {
-        let mut wj = Vec::with_capacity(((cin + cpad) * s * 4) as usize);
-        for c in 0..cin as usize {
-            let start = c * row + (j * s * 4) as usize;
-            wj.extend_from_slice(&w[start..start + (s * 4) as usize]);
-        }
-        wj.resize(((cin + cpad) * s * 4) as usize, 0);
-        let w_name = name(&format!("weight{j}"));
-        initializers.push(encode_tensor(&w_name, tensor::FLOAT, &[cin + cpad, s], &wj));
-
-        let pads = int64(initializers, &format!("pads{j}"), &[0, 0, j * s, 0, 0, (r - 1 - j) * s]);
-        let (frames, seg, padded) = (name(&format!("frames{j}")), name(&format!("segment{j}")), name(&format!("segment{j}_padded")));
-        nodes.push(encode_node("MatMul", &name(&format!("MatMul{j}")), &[&xt, &w_name], &[&frames], &[])); // [N, L, S]
-        nodes.push(encode_node("Reshape", &name(&format!("Reshape{j}")), &[&frames, &flat], &[&seg], &[])); // [N, 1, L*S]
-        nodes.push(encode_node("Pad", &name(&format!("Pad{j}")), &[&seg, &pads], &[&padded], &[]));
-        acc = Some(match acc {
-            None => padded,
-            Some(prev) => {
-                let out = if j == r - 1 { conv.output.to_owned() } else { name(&format!("sum{j}")) };
-                nodes.push(encode_node("Add", &name(&format!("Add{j}")), &[&prev, &padded], &[&out], &[]));
-                out
-            }
-        });
-    }
-    if r == 1 {
-        // Single segment: nothing to add, just forward it.
-        nodes.push(encode_node("Identity", &name("Identity"), &[acc.as_deref().unwrap()], &[conv.output], &[]));
+impl Rewrites {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 
-/// Rewrites large-stride 1-D `ConvTranspose` nodes (HTDemucs' iSTFT) into `MatMul` + overlap-add.
+impl std::fmt::Display for Rewrites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "STFT→FFT ×{}, iSTFT→FFT ×{}, iSTFT→MatMul ×{}", self.stft_fft, self.istft_fft, self.istft_matmul)
+    }
+}
+
+/// Rewrites HTDemucs' STFT (a pair of strided `Conv`s) and iSTFT (a strided `ConvTranspose`) into
+/// FFTs built from small MatMuls, and other large-stride `ConvTranspose`s into MatMul +
+/// overlap-add.
 ///
 /// Returns `Ok(None)` when the model contains nothing to rewrite.
-pub fn rewrite_istft_conv_transpose(model: &[u8]) -> Result<Option<Vec<u8>>> {
+pub fn optimize_for_webgpu(model: &[u8]) -> Result<Option<(Vec<u8>, Rewrites)>> {
     let model_fields = parse(model)?;
 
-    // Pad/Slice/Reshape with tensor inputs need opset >= 13.
+    // Pad/Slice/Reshape/Squeeze with tensor inputs need opset >= 13.
     let opset = model_fields
         .iter()
         .filter(|f| f.num == model::OPSET_IMPORT)
@@ -426,48 +740,92 @@ pub fn rewrite_istft_conv_transpose(model: &[u8]) -> Result<Option<Vec<u8>>> {
         .filter(|f| f.num == graph::INITIALIZER)
         .map(|f| Ok((read_str(&parse(f.payload)?, tensor::NAME), f.payload)))
         .collect::<Result<_>>()?;
-    let nodes: Vec<(Field, Node)> = graph_fields
-        .iter()
-        .filter(|f| f.num == graph::NODE)
-        .map(|f| Ok((*f, Node::parse(f.payload)?)))
-        .collect::<Result<_>>()?;
+    let nodes: Vec<Node> = graph_fields.iter().filter(|f| f.num == graph::NODE).map(|f| Node::parse(f.payload)).collect::<Result<_>>()?;
     let mut weight = |name: &str| -> Result<Option<FloatTensor>> {
         if let Some((_, buf)) = initializers.iter().find(|(n, _)| *n == name) {
             return FloatTensor::parse(buf);
         }
-        let constant = nodes.iter().find(|(_, n)| n.op_type == "Constant" && n.domain.is_empty() && n.outputs == [name]);
-        match constant.and_then(|(_, n)| n.attr("value")).and_then(|a| a.iter().find(|f| f.num == attr::T)) {
+        let constant = nodes.iter().find(|n| n.op_type == "Constant" && n.domain.is_empty() && n.outputs == [name]);
+        match constant.and_then(|n| n.attr("value")).and_then(|a| a.iter().find(|f| f.num == attr::T)) {
             Some(t) => FloatTensor::parse(t.payload),
             None => Ok(None),
         }
     };
+    let to_f32 = |t: &FloatTensor| -> Vec<f32> { t.data.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect() };
 
-    let mut replacements: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
+    // Node index -> replacement nodes (empty to remove the node).
+    let mut replacements: std::collections::BTreeMap<usize, Vec<Vec<u8>>> = Default::default();
     let mut new_initializers = Vec::new();
-    for (index, (_, node)) in nodes.iter().enumerate() {
-        if let Some(conv) = match_istft_conv(node, &mut weight)? {
-            let prefix = format!("stemgen_istft{}{}", replacements.len(), conv.name.replace('/', "_"));
-            let mut new_nodes = Vec::new();
-            emit_matmul_overlap_add(&conv, &prefix, &mut new_nodes, &mut new_initializers);
-            replacements.push((index, new_nodes));
+    let mut rewrites = Rewrites::default();
+
+    // STFT: two strided Convs on the same input, one with cos and one with sin DFT weights.
+    let mut convs: Vec<(usize, StridedConv)> = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(conv) = match_strided_conv(node, "Conv", &mut weight)? {
+            convs.push((index, conv));
         }
     }
-    if replacements.is_empty() {
+    for (i, (index_a, a)) in convs.iter().enumerate() {
+        let pair: Vec<_> = convs.iter().filter(|(_, c)| c.input == a.input).collect();
+        let [(_, first), (index_b, b)] = pair.as_slice() else { continue };
+        let k = a.kernel as usize;
+        // Handle each pair once, from its first Conv.
+        if !std::ptr::eq(first, a) || a.kernel != b.kernel || a.stride != b.stride || a.weight.dims[0] as usize != k / 2 + 1 || fft_split(k).is_none() {
+            continue;
+        }
+        let (wa, wb) = (to_f32(&a.weight), to_f32(&b.weight));
+        // The cos conv has the window in its DC row; the sin conv's DC row is zero.
+        let a_is_cos = wa[..k].iter().any(|v| *v != 0.0);
+        let (cos_conv, sin_conv, cos_w, sin_w) = if a_is_cos { (a, b, &wa, &wb) } else { (b, a, &wb, &wa) };
+        let Some(fit) = fit_windowed_dft(cos_w, sin_w, k) else { continue };
+        let mut e = Emitter::new(format!("stemgen_stft{i}"), &mut new_initializers);
+        emit_stft_fft(&mut e, a.input, cos_conv.output, sin_conv.output, k, a.stride as usize, &fit);
+        replacements.insert(*index_a, e.nodes);
+        replacements.insert(*index_b, Vec::new());
+        rewrites.stft_fft += 1;
+    }
+
+    // iSTFT: a strided ConvTranspose whose weight holds the cos then the sin DFT rows.
+    for (index, node) in nodes.iter().enumerate() {
+        let Some(conv) = match_strided_conv(node, "ConvTranspose", &mut weight)? else { continue };
+        let k = conv.kernel as usize;
+        let prefix = format!("stemgen_istft{}", rewrites.istft_fft + rewrites.istft_matmul);
+        let mut e = Emitter::new(prefix, &mut new_initializers);
+        let fit = (conv.weight.dims[0] as usize == 2 * (k / 2 + 1) && fft_split(k).is_some())
+            .then(|| {
+                let w = to_f32(&conv.weight);
+                let (cos_w, sin_w) = w.split_at(w.len() / 2);
+                fit_windowed_dft(cos_w, sin_w, k)
+            })
+            .flatten();
+        match fit {
+            Some(fit) => {
+                emit_istft_fft(&mut e, conv.input, conv.output, k, conv.stride as usize, &fit);
+                rewrites.istft_fft += 1;
+            }
+            None => {
+                emit_matmul_overlap_add(&mut e, conv.input, conv.output, &conv.weight, conv.kernel, conv.stride);
+                rewrites.istft_matmul += 1;
+            }
+        }
+        replacements.insert(index, e.nodes);
+    }
+    if rewrites.is_empty() {
         return Ok(None);
     }
 
     // Re-emit the graph with the replaced nodes swapped in place (keeps topological order).
     let mut new_graph = Vec::with_capacity(graph_field.payload.len() + new_initializers.iter().map(Vec::len).sum::<usize>() + 4096);
     let mut node_index = 0;
-    let mut replacements = replacements.into_iter().peekable();
     for f in &graph_fields {
         if f.num == graph::NODE {
-            if replacements.peek().is_some_and(|(i, _)| *i == node_index) {
-                for n in replacements.next().unwrap().1 {
-                    put_bytes(&mut new_graph, graph::NODE, &n);
+            match replacements.get(&node_index) {
+                Some(new_nodes) => {
+                    for n in new_nodes {
+                        put_bytes(&mut new_graph, graph::NODE, n);
+                    }
                 }
-            } else {
-                new_graph.extend_from_slice(f.raw);
+                None => new_graph.extend_from_slice(f.raw),
             }
             node_index += 1;
         } else {
@@ -486,7 +844,7 @@ pub fn rewrite_istft_conv_transpose(model: &[u8]) -> Result<Option<Vec<u8>>> {
             out.extend_from_slice(f.raw);
         }
     }
-    Ok(Some(out))
+    Ok(Some((out, rewrites)))
 }
 
 #[cfg(test)]
@@ -496,50 +854,52 @@ mod tests {
     use ort::session::Session;
     use ort::value::Tensor;
 
-    /// Builds a model with a single `ConvTranspose` whose weight is a `Constant` node.
-    fn conv_transpose_model(cin: i64, kernel: i64, stride: i64, weight: &[f32]) -> Vec<u8> {
-        let w_bytes: Vec<u8> = weight.iter().flat_map(|v| v.to_le_bytes()).collect();
+    fn constant(name: &str, dims: &[i64], values: &[f32]) -> Vec<u8> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut value_attr = Vec::new();
         put_bytes(&mut value_attr, attr::NAME, b"value");
-        put_bytes(&mut value_attr, attr::T, &encode_tensor("w", tensor::FLOAT, &[cin, 1, kernel], &w_bytes));
+        put_bytes(&mut value_attr, attr::T, &encode_tensor(name, tensor::FLOAT, dims, &bytes));
         put_int(&mut value_attr, attr::TYPE, 4); // TENSOR
-        let mut constant = Vec::new();
-        put_bytes(&mut constant, node::OUTPUT, b"w");
-        put_bytes(&mut constant, node::NAME, b"/Constant");
-        put_bytes(&mut constant, node::OP_TYPE, b"Constant");
-        put_bytes(&mut constant, node::ATTRIBUTE, &value_attr);
+        let mut node = Vec::new();
+        put_bytes(&mut node, node::OUTPUT, name.as_bytes());
+        put_bytes(&mut node, node::NAME, format!("/Constant_{name}").as_bytes());
+        put_bytes(&mut node, node::OP_TYPE, b"Constant");
+        put_bytes(&mut node, node::ATTRIBUTE, &value_attr);
+        node
+    }
 
-        let conv = encode_node("ConvTranspose", "/ConvTranspose", &["x", "w"], &["y"], &[("kernel_shape", &[kernel]), ("strides", &[stride])]);
-
-        // ValueInfoProto { name = 1, type = 2 { tensor_type = 1 { elem_type = 1, shape = 2 } } }
-        let value_info = |name: &str, dims: &[Option<i64>]| {
-            let mut shape = Vec::new();
-            for d in dims {
-                let mut dim = Vec::new();
-                match d {
-                    Some(v) => put_int(&mut dim, 1, *v),
-                    None => put_bytes(&mut dim, 2, b"dyn"),
-                }
-                put_bytes(&mut shape, 1, &dim);
+    /// ValueInfoProto { name = 1, type = 2 { tensor_type = 1 { elem_type = 1, shape = 2 } } }
+    fn value_info(name: &str, dims: &[Option<i64>]) -> Vec<u8> {
+        let mut shape = Vec::new();
+        for d in dims {
+            let mut dim = Vec::new();
+            match d {
+                Some(v) => put_int(&mut dim, 1, *v),
+                None => put_bytes(&mut dim, 2, b"dyn"),
             }
-            let mut tensor_type = Vec::new();
-            put_int(&mut tensor_type, 1, tensor::FLOAT);
-            put_bytes(&mut tensor_type, 2, &shape);
-            let mut ty = Vec::new();
-            put_bytes(&mut ty, 1, &tensor_type);
-            let mut vi = Vec::new();
-            put_bytes(&mut vi, 1, name.as_bytes());
-            put_bytes(&mut vi, 2, &ty);
-            vi
-        };
+            put_bytes(&mut shape, 1, &dim);
+        }
+        let mut tensor_type = Vec::new();
+        put_int(&mut tensor_type, 1, tensor::FLOAT);
+        put_bytes(&mut tensor_type, 2, &shape);
+        let mut ty = Vec::new();
+        put_bytes(&mut ty, 1, &tensor_type);
+        let mut vi = Vec::new();
+        put_bytes(&mut vi, 1, name.as_bytes());
+        put_bytes(&mut vi, 2, &ty);
+        vi
+    }
 
+    fn model(nodes: &[Vec<u8>], input: (&str, &[Option<i64>]), outputs: &[(&str, &[Option<i64>])]) -> Vec<u8> {
         let mut graph = Vec::new();
-        put_bytes(&mut graph, graph::NODE, &constant);
-        put_bytes(&mut graph, graph::NODE, &conv);
+        for n in nodes {
+            put_bytes(&mut graph, graph::NODE, n);
+        }
         put_bytes(&mut graph, 2, b"test"); // name
-        put_bytes(&mut graph, 11, &value_info("x", &[None, Some(cin), None]));
-        put_bytes(&mut graph, 12, &value_info("y", &[None, Some(1), None]));
-
+        put_bytes(&mut graph, 11, &value_info(input.0, input.1));
+        for (name, dims) in outputs {
+            put_bytes(&mut graph, 12, &value_info(name, dims));
+        }
         let mut opset_import = Vec::new();
         put_int(&mut opset_import, opset::VERSION, 17);
         let mut model = Vec::new();
@@ -549,37 +909,132 @@ mod tests {
         model
     }
 
-    fn run(model: &[u8], input: &[f32], shape: [usize; 3]) -> Vec<f32> {
-        let mut session = Session::builder().unwrap().commit_from_memory(model).unwrap();
-        let x = Tensor::<f32>::from_array((shape, input.to_vec())).unwrap();
-        let out = session.run(ort::inputs! { "x" => x }).unwrap();
-        out["y"].try_extract_array::<f32>().unwrap().iter().copied().collect()
+    fn strided(op: &str, input: &str, weight: &str, output: &str, kernel: i64, stride: i64) -> Vec<u8> {
+        encode_node(op, &format!("/{output}"), &[input, weight], &[output], &[("kernel_shape", Attr::Ints(&[kernel])), ("strides", Attr::Ints(&[stride]))])
     }
 
-    #[test]
-    fn test_istft_rewrite_matches_conv_transpose() {
-        // Odd Cin exercises the channel padding; R = K / S = 4 like HTDemucs.
-        let (cin, kernel, stride, n, l) = (7i64, 256i64, 64i64, 2usize, 5usize);
-        let pseudo = |i: usize, seed: usize| ((i * 7919 + seed * 104729) % 1000) as f32 / 500.0 - 1.0;
-        let weight: Vec<f32> = (0..(cin * kernel) as usize).map(|i| pseudo(i, 1)).collect();
-        let input: Vec<f32> = (0..n * cin as usize * l).map(|i| pseudo(i, 2)).collect();
+    fn run(model: &[u8], input: &[f32], shape: &[usize], outputs: &[&str]) -> Vec<Vec<f32>> {
+        let mut session = Session::builder().unwrap().commit_from_memory(model).unwrap();
+        let x = Tensor::<f32>::from_array((shape.to_vec(), input.to_vec())).unwrap();
+        let out = session.run(ort::inputs! { "x" => x }).unwrap();
+        outputs.iter().map(|o| out[*o].try_extract_array::<f32>().unwrap().iter().copied().collect()).collect()
+    }
 
-        let model = conv_transpose_model(cin, kernel, stride, &weight);
-        let patched = rewrite_istft_conv_transpose(&model).unwrap().expect("model should be rewritten");
-
-        let expected = run(&model, &input, [n, cin as usize, l]);
-        let actual = run(&patched, &input, [n, cin as usize, l]);
-        assert_eq!(expected.len(), n * ((l - 1) * stride as usize + kernel as usize));
+    fn assert_close(expected: &[f32], actual: &[f32], tolerance: f32) {
         assert_eq!(expected.len(), actual.len());
-        for (e, a) in expected.iter().zip(&actual) {
-            assert!((e - a).abs() < 1e-4, "{e} != {a}");
+        let peak = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (i, (e, a)) in expected.iter().zip(actual).enumerate() {
+            assert!((e - a).abs() <= tolerance * peak, "at {i}: {e} != {a} (peak {peak})");
         }
     }
 
+    fn pseudo(i: usize, seed: usize) -> f32 {
+        ((i * 7919 + seed * 104729) % 1000) as f32 / 500.0 - 1.0
+    }
+
+    /// Hann-windowed DFT rows like HTDemucs': `[K/2+1, 1, K]` cos and sin weights.
+    fn dft_weights(k: usize, cos_scale: impl Fn(usize) -> f64, sin_scale: impl Fn(usize) -> f64, window_scale: f64) -> (Vec<f32>, Vec<f32>) {
+        let bins = k / 2 + 1;
+        let window = |n: usize| window_scale * (0.5 - 0.5 * (std::f64::consts::TAU * n as f64 / k as f64).cos());
+        let (mut cos_w, mut sin_w) = (Vec::new(), Vec::new());
+        for f in 0..bins {
+            for n in 0..k {
+                let angle = std::f64::consts::TAU * ((f * n) % k) as f64 / k as f64;
+                cos_w.push((cos_scale(f) * window(n) * angle.cos()) as f32);
+                sin_w.push((sin_scale(f) * window(n) * angle.sin()) as f32);
+            }
+        }
+        (cos_w, sin_w)
+    }
+
     #[test]
-    fn test_istft_rewrite_skips_small_strides() {
+    fn test_stft_rewrite_matches_conv() {
+        let (k, s, n, l) = (256usize, 64usize, 2usize, 6usize);
+        let bins = k / 2 + 1;
+        let t = (l - 1) * s + k;
+        let (cos_w, sin_w) = dft_weights(k, |_| 1.0, |_| -1.0, 1.0 / 16.0);
+        let dims = [bins as i64, 1, k as i64];
+        let model = model(
+            &[
+                constant("wc", &dims, &cos_w),
+                constant("ws", &dims, &sin_w),
+                strided("Conv", "x", "wc", "re", k as i64, s as i64),
+                strided("Conv", "x", "ws", "im", k as i64, s as i64),
+            ],
+            ("x", &[None, Some(1), Some(t as i64)]),
+            &[("re", &[None, Some(bins as i64), None]), ("im", &[None, Some(bins as i64), None])],
+        );
+        let (patched, rewrites) = optimize_for_webgpu(&model).unwrap().expect("model should be rewritten");
+        assert_eq!(rewrites, Rewrites { stft_fft: 1, ..Default::default() });
+
+        let input: Vec<f32> = (0..n * t).map(|i| pseudo(i, 3)).collect();
+        let expected = run(&model, &input, &[n, 1, t], &["re", "im"]);
+        let actual = run(&patched, &input, &[n, 1, t], &["re", "im"]);
+        assert_eq!(expected[0].len(), n * bins * l);
+        assert_close(&expected[0], &actual[0], 1e-5);
+        assert_close(&expected[1], &actual[1], 1e-5);
+    }
+
+    #[test]
+    fn test_istft_fft_rewrite_matches_conv_transpose() {
+        let (k, s, n, l) = (256usize, 64usize, 3usize, 5usize);
+        let bins = k / 2 + 1;
+        let doubled = |f: usize| if f == 0 || f == k / 2 { 1.0 } else { 2.0 };
+        let (cos_w, sin_w) = dft_weights(k, doubled, |f| -doubled(f), 1.0 / 64.0);
+        let weight: Vec<f32> = cos_w.into_iter().chain(sin_w).collect();
+        let model = model(
+            &[constant("w", &[2 * bins as i64, 1, k as i64], &weight), strided("ConvTranspose", "x", "w", "y", k as i64, s as i64)],
+            ("x", &[None, Some(2 * bins as i64), None]),
+            &[("y", &[None, Some(1), None])],
+        );
+        let (patched, rewrites) = optimize_for_webgpu(&model).unwrap().expect("model should be rewritten");
+        assert_eq!(rewrites, Rewrites { istft_fft: 1, ..Default::default() });
+
+        let input: Vec<f32> = (0..n * 2 * bins * l).map(|i| pseudo(i, 4)).collect();
+        let expected = run(&model, &input, &[n, 2 * bins, l], &["y"]);
+        let actual = run(&patched, &input, &[n, 2 * bins, l], &["y"]);
+        assert_eq!(expected[0].len(), n * ((l - 1) * s + k));
+        assert_close(&expected[0], &actual[0], 1e-5);
+    }
+
+    #[test]
+    fn test_istft_matmul_rewrite_matches_conv_transpose() {
+        // Arbitrary (non-DFT) weights fall back to MatMul + overlap-add; odd Cin exercises the
+        // channel padding.
+        let (cin, k, s, n, l) = (7usize, 256usize, 64usize, 2usize, 5usize);
+        let weight: Vec<f32> = (0..cin * k).map(|i| pseudo(i, 1)).collect();
+        let model = model(
+            &[constant("w", &[cin as i64, 1, k as i64], &weight), strided("ConvTranspose", "x", "w", "y", k as i64, s as i64)],
+            ("x", &[None, Some(cin as i64), None]),
+            &[("y", &[None, Some(1), None])],
+        );
+        let (patched, rewrites) = optimize_for_webgpu(&model).unwrap().expect("model should be rewritten");
+        assert_eq!(rewrites, Rewrites { istft_matmul: 1, ..Default::default() });
+
+        let input: Vec<f32> = (0..n * cin * l).map(|i| pseudo(i, 2)).collect();
+        let expected = run(&model, &input, &[n, cin, l], &["y"]);
+        let actual = run(&patched, &input, &[n, cin, l], &["y"]);
+        assert_eq!(expected[0].len(), n * ((l - 1) * s + k));
+        assert_close(&expected[0], &actual[0], 1e-5);
+    }
+
+    #[test]
+    fn test_rewrite_skips_small_strides() {
         let weight = vec![0.5f32; 3 * 4];
-        let model = conv_transpose_model(3, 4, 2, &weight);
-        assert!(rewrite_istft_conv_transpose(&model).unwrap().is_none());
+        let model = model(
+            &[constant("w", &[3, 1, 4], &weight), strided("ConvTranspose", "x", "w", "y", 4, 2)],
+            ("x", &[None, Some(3), None]),
+            &[("y", &[None, Some(1), None])],
+        );
+        assert!(optimize_for_webgpu(&model).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_fit_rejects_non_dft_weights() {
+        let k = 256;
+        let (cos_w, mut sin_w) = dft_weights(k, |_| 1.0, |_| -1.0, 1.0);
+        assert!(fit_windowed_dft(&cos_w, &sin_w, k).is_some());
+        sin_w[5 * k + 17] += 0.1;
+        assert!(fit_windowed_dft(&cos_w, &sin_w, k).is_none());
     }
 }

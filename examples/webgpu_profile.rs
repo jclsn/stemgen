@@ -8,8 +8,9 @@
 //! wall time per run and a breakdown of GPU time by operator type for the last run, using the
 //! timestamp queries the WebGPU EP records when profiling is enabled.
 //!
-//! Environment: `RUNS=<n>`, `NO_PATCH=1` (skip the iSTFT rewrite), `KEEP_PROFILE=1` (keep the
-//! raw ORT profile JSON), `CONFIG="key=value;..."` (extra session config entries).
+//! Environment: `RUNS=<n>`, `NO_PATCH=1` (skip the model rewrite), `KEEP_PROFILE=1` (keep the
+//! raw ORT profile JSON), `CONFIG="key=value;..."` (extra session config entries), `DUMP=<file>` (write the last
+//! run's output as raw little-endian f32).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -44,13 +45,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let path = if model.starts_with("http") { stemgen::demucs::fetch_model(&model)? } else { model.into() };
     let bytes = std::fs::read(&path)?;
-    let bytes = match patch.then(|| stemgen::onnx_patch::rewrite_istft_conv_transpose(&bytes)).transpose()? {
-        Some(Some(patched)) => {
-            println!("iSTFT rewrite: applied");
+    let bytes = match patch.then(|| stemgen::onnx_patch::optimize_for_webgpu(&bytes)).transpose()? {
+        Some(Some((patched, rewrites))) => {
+            println!("model rewrite: {rewrites}");
             patched
         }
         _ => {
-            println!("iSTFT rewrite: {}", if patch { "nothing to rewrite" } else { "disabled" });
+            println!("model rewrite: {}", if patch { "nothing to rewrite" } else { "disabled" });
             bytes
         }
     };
@@ -87,7 +88,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let tensor = Tensor::<f32>::from_array(([1usize, 2, CHUNK], input.clone()))?;
         let start = Instant::now();
         let outputs = session.run(ort::inputs! { "input" => tensor })?;
-        let _ = outputs[0].try_extract_array::<f32>()?;
+        let output = outputs[0].try_extract_array::<f32>()?;
+        if i == runs {
+            if let Ok(path) = std::env::var("DUMP") {
+                std::fs::write(path, output.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+            }
+        }
         println!("{} {:?}", if i == 0 { "warm-up" } else { "run    " }, start.elapsed());
     }
 
